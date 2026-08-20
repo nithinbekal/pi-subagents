@@ -1,0 +1,39 @@
+{
+  "name": "pi-subagents",
+  "version": "0.1.0",
+  "description": "Tmux-based isolated subagents with push report delivery for the Pi coding agent",
+  "type": "module",
+  "license": "MIT",
+  "keywords": [
+    "pi-package",
+    "pi-coding-agent",
+    "subagents",
+    "tmux"
+  ],
+  "files": [
+    "extensions",
+    "skills",
+    "README.md",
+    "LICENSE"
+  ],
+  "bin": {
+    "subagents": "skills/subagents/subagents"
+  },
+  "scripts": {
+    "test": "bash -n skills/subagents/subagents && node --experimental-strip-types --test tests/config.test.ts && bash tests/cli-smoke.sh && bash tests/public-safety.sh"
+  },
+  "pi": {
+    "extensions": [
+      "./extensions/subagents-watch.ts"
+    ],
+    "skills": [
+      "./skills"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "engines": {
+    "node": ">=22.6"
+  }
+}

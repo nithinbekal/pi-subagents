@@ -7,16 +7,7 @@ TMP=$(mktemp -d "${TMPDIR:-/tmp}/pi-subagents-cli.XXXXXX")
 SOCKET="pi-subagents-test-$$"
 trap 'tmux -L "$SOCKET" kill-server 2>/dev/null || true; rm -rf "$TMP"' EXIT
 
-mkdir -p "$TMP/home" "$TMP/roles" "$TMP/state" "$TMP/bin"
-cat >"$TMP/roles/example.md" <<'ROLE'
----
-name: example
-model: example-provider/example-model
-tools: [read, bash]
----
-
-Perform the assigned task and report the result.
-ROLE
+mkdir -p "$TMP/home" "$TMP/state" "$TMP/bin"
 cat >"$TMP/bin/auth-wrapper" <<'WRAPPER'
 #!/bin/sh
 exec "$@"
@@ -25,9 +16,7 @@ chmod +x "$TMP/bin/auth-wrapper"
 
 CONFIG=$(
 	HOME="$TMP/home" \
-	SUBAGENTS_AGENT_DIR="$TMP/agent" \
 	SUBAGENTS_STATE_DIR="$TMP/state" \
-	SUBAGENTS_ROLE_DIRS="$TMP/roles" \
 	SUBAGENTS_PI="$TMP/bin/auth-wrapper pi" \
 	SUBAGENTS_WINDOW_NAME="helpers" \
 	"$CLI" config
@@ -35,18 +24,14 @@ CONFIG=$(
 
 grep -Fqx "launcher=$TMP/bin/auth-wrapper pi" <<<"$CONFIG"
 grep -Fqx "state_dir=$TMP/state" <<<"$CONFIG"
-grep -Fqx "role_dirs=$TMP/roles" <<<"$CONFIG"
-grep -Fqx "agent_dir=$TMP/agent" <<<"$CONFIG"
 grep -Fqx "window_name=helpers" <<<"$CONFIG"
-
-ROLES=$(HOME="$TMP/home" SUBAGENTS_STATE_DIR="$TMP/state" SUBAGENTS_ROLE_DIRS="$TMP/roles" "$CLI" roles)
-grep -Fqx "# $TMP/roles" <<<"$ROLES"
-grep -Eq '^  example +\(example-provider/example-model\)$' <<<"$ROLES"
+[ "$(wc -l <<<"$CONFIG" | tr -d ' ')" = 3 ]
 
 HELP=$(HOME="$TMP/home" SUBAGENTS_STATE_DIR="$TMP/state" "$CLI" --help)
 grep -Fq 'subagents config' <<<"$HELP"
+grep -Fq 'subagents run [-m MODEL] [--effort LEVEL] <task...>' <<<"$HELP"
 
-if env -u TMUX -u TMUX_PANE HOME="$TMP/home" SUBAGENTS_STATE_DIR="$TMP/state" SUBAGENTS_ROLE_DIRS="$TMP/roles" "$CLI" run missing-role task >"$TMP/out" 2>"$TMP/err"; then
+if env -u TMUX -u TMUX_PANE HOME="$TMP/home" SUBAGENTS_STATE_DIR="$TMP/state" "$CLI" run "complete brief" >"$TMP/out" 2>"$TMP/err"; then
 	echo "expected run outside tmux to fail" >&2
 	exit 1
 fi
@@ -54,7 +39,27 @@ grep -Fq 'subagents requires tmux' "$TMP/err"
 
 cat >"$TMP/bin/fake-pi" <<FAKE_PI
 #!/bin/sh
-printf '%s\n' "\$@" >"$TMP/pi-args"
+last=""
+protocol=""
+next_is_protocol=0
+for arg do
+	last="\$arg"
+	if [ "\$next_is_protocol" = 1 ]; then
+		protocol="\$arg"
+		next_is_protocol=0
+	elif [ "\$arg" = "--append-system-prompt" ]; then
+		next_is_protocol=1
+	fi
+done
+case "\$last" in
+	*inherit-smoke*) out="$TMP/pi-args.inherit" ;;
+	*override-smoke*) out="$TMP/pi-args.override" ;;
+	*) out="$TMP/pi-args.unknown" ;;
+esac
+printf '%s\n' "\$@" >"\$out"
+result=\$(grep '/result\.md\$' "\$protocol" | head -1 | sed 's/^[[:space:]]*//')
+printf 'completed report for %s\n' "\$last" >"\$result"
+printf '%s\n' '@@DONE@@'
 sleep 10
 FAKE_PI
 chmod +x "$TMP/bin/fake-pi"
@@ -62,31 +67,75 @@ cat >"$TMP/tmux-smoke" <<TMUX_SMOKE
 #!/bin/sh
 export HOME="$TMP/home"
 export SUBAGENTS_STATE_DIR="$TMP/state"
-export SUBAGENTS_ROLE_DIRS="$TMP/roles"
 export SUBAGENTS_PI="$TMP/bin/fake-pi"
+export SUBAGENTS_WINDOW_NAME="helpers"
 cd "$ROOT"
-"$CLI" run example "tmux smoke task" >"$TMP/run.out" 2>"$TMP/run.err"
-echo \$? >"$TMP/run.rc"
+"$CLI" run "Inspect the target, implement safely, verify, and report for inherit-smoke" >"$TMP/run-inherit.out" 2>"$TMP/run-inherit.err" || exit 1
+"$CLI" run --model example-provider/example-model --effort high "Implement and verify the complete brief for override-smoke" >"$TMP/run-override.out" 2>"$TMP/run-override.err" || exit 1
+if "$CLI" run -m unqualified "invalid model must fail" >"$TMP/run-invalid.out" 2>"$TMP/run-invalid.err"; then
+	exit 1
+fi
+"$CLI" doctor >"$TMP/doctor.out" 2>"$TMP/doctor.err" || exit 1
+"$CLI" wait 1 10 >"$TMP/wait.out" 2>"$TMP/wait.err" || exit 1
+for _ in 1 2 3 4 5; do
+	result=\$(find "$TMP/state" -type f -path '*/2/result.md' -print -quit)
+	[ -n "\$result" ] && [ -s "\$result" ] && break
+	sleep 0.1
+done
+"$CLI" events >"$TMP/events.out" 2>"$TMP/events.err" || exit 1
+"$CLI" reap >"$TMP/reap.out" 2>"$TMP/reap.err" || exit 1
+"$CLI" status >"$TMP/status.out" 2>"$TMP/status.err" || exit 1
+echo 0 >"$TMP/run.rc"
 TMUX_SMOKE
 chmod +x "$TMP/tmux-smoke"
 tmux -L "$SOCKET" new-session -d -s smoke "$TMP/tmux-smoke"
-for _ in {1..50}; do
-	[ -f "$TMP/run.rc" ] && break
+for _ in {1..100}; do
+	[ -f "$TMP/run.rc" ] && [ -f "$TMP/pi-args.inherit" ] && [ -f "$TMP/pi-args.override" ] && break
 	sleep 0.1
 done
 [ "$(cat "$TMP/run.rc" 2>/dev/null)" = 0 ]
-grep -Fq 'started subagent #1 (example)' "$TMP/run.out"
+
+grep -Fq 'started subagent #1 —' "$TMP/run-inherit.out"
+grep -Fq 'model inherited' "$TMP/run-inherit.out"
+grep -Fq 'started subagent #2 —' "$TMP/run-override.out"
+grep -Fq 'model example-provider/example-model, effort high' "$TMP/run-override.out"
+grep -Fq "model 'unqualified' is not provider-qualified" "$TMP/run-invalid.err"
+grep -Fqx 'doctor: healthy' "$TMP/doctor.out"
+grep -Fq '=== subagent #1 report (done) ===' "$TMP/wait.out"
+grep -Fq 'completed report for Inspect the target' "$TMP/wait.out"
+awk -F '\t' 'NF != 3 || $1 != "2" || $2 != "done" { exit 1 } END { if (NR != 1) exit 1 }' "$TMP/events.out"
+grep -Fq '/2/reports/1.md' "$TMP/events.out"
+grep -Fqx 'no new reports' "$TMP/reap.out"
+grep -Eq '^#1[[:space:]]+idle$' "$TMP/status.out"
+grep -Eq '^#2[[:space:]]+idle$' "$TMP/status.out"
+
 TASK_FILE=$(find "$TMP/state" -type f -path '*/1/task' -print -quit)
 [ -n "$TASK_FILE" ]
 AGENT_DIR=${TASK_FILE%/task}
-grep -Fqx 'tmux smoke task' "$AGENT_DIR/task"
-grep -Fqx 'example' "$AGENT_DIR/role"
+grep -Fqx 'Inspect the target, implement safely, verify, and report for inherit-smoke' "$AGENT_DIR/task"
+grep -Fq 'complete worker brief' "$AGENT_DIR/protocol.md"
 grep -Fq '@@DONE@@' "$AGENT_DIR/protocol.md"
-for _ in {1..50}; do
-	[ -f "$TMP/pi-args" ] && break
-	sleep 0.1
+for state_file in birth pane protocol.md result.md sid task; do
+	[ -e "$AGENT_DIR/$state_file" ]
 done
-grep -Fqx -- '--no-extensions' "$TMP/pi-args"
-grep -Fqx -- '--append-system-prompt' "$TMP/pi-args"
+
+for args in "$TMP/pi-args.inherit" "$TMP/pi-args.override"; do
+	grep -Fqx -- '--no-extensions' "$args"
+	grep -Fqx -- '--no-skills' "$args"
+	grep -Fqx -- '--no-prompt-templates' "$args"
+	grep -Fqx -- '--no-context-files' "$args"
+	grep -Fqx -- '--no-session' "$args"
+	[ "$(grep -Fxc -- '--append-system-prompt' "$args")" = 1 ]
+done
+if grep -Fqx -- '--model' "$TMP/pi-args.inherit"; then
+	echo "inherited launch unexpectedly passed a model override" >&2
+	exit 1
+fi
+grep -Fqx -- '--model' "$TMP/pi-args.override"
+grep -Fqx -- 'example-provider/example-model' "$TMP/pi-args.override"
+grep -Fqx -- '--thinking' "$TMP/pi-args.override"
+grep -Fqx -- 'high' "$TMP/pi-args.override"
+grep -Fqx -- 'Inspect the target, implement safely, verify, and report for inherit-smoke' "$TMP/pi-args.inherit"
+grep -Fqx -- 'Implement and verify the complete brief for override-smoke' "$TMP/pi-args.override"
 
 echo "cli smoke: ok"

@@ -5,13 +5,6 @@ import { fileURLToPath } from "node:url";
 
 export type SubagentsEnvironment = NodeJS.ProcessEnv;
 
-export function resolveAgentDir(
-	env: SubagentsEnvironment = process.env,
-	home: string = os.homedir(),
-): string {
-	return env.SUBAGENTS_AGENT_DIR || path.join(home, ".pi", "agent");
-}
-
 export function resolveStateDir(
 	env: SubagentsEnvironment = process.env,
 	home: string = os.homedir(),
@@ -28,21 +21,16 @@ export function packageCliPath(): string {
 
 export function subagentsBinCandidates(
 	env: SubagentsEnvironment = process.env,
-	home: string = os.homedir(),
 ): string[] {
-	const candidates = [
-		env.SUBAGENTS_BIN,
-		packageCliPath(),
-		path.join(resolveAgentDir(env, home), "skills", "subagents", "subagents"),
-	].filter((candidate): candidate is string => Boolean(candidate));
+	const candidates = [env.SUBAGENTS_BIN, packageCliPath()]
+		.filter((candidate): candidate is string => Boolean(candidate));
 	return [...new Set(candidates.map((candidate) => path.resolve(candidate)))];
 }
 
 export function findSubagentsBin(
 	env: SubagentsEnvironment = process.env,
-	home: string = os.homedir(),
 ): string | null {
-	for (const candidate of subagentsBinCandidates(env, home)) {
+	for (const candidate of subagentsBinCandidates(env)) {
 		try {
 			fs.accessSync(candidate, fs.constants.X_OK);
 			return candidate;

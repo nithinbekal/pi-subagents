@@ -6,16 +6,15 @@
  * lead — so you don't have to block in `subagents wait` or poll manually.
  *
  * All detection lives in the CLI (`subagents events`, which prints NEW completion
- * events as TSV: id<TAB>role<TAB>status<TAB>reportPath and advances its detection
+ * events as TSV: id<TAB>status<TAB>reportPath and advances its detection
  * markers). This extension drains it on an interval + fs.watch and pushes via
  * pi.sendMessage(steer, triggerTurn). Late events are durably spooled for replay.
  *
  * Without this extension the skill still works in pull mode (wait/reap/status).
  *
  * Env:
- *   SUBAGENTS_BIN        path to the subagents script (else package-local/autodetected)
+ *   SUBAGENTS_BIN        path to the subagents script (else package-local)
  *   SUBAGENTS_STATE_DIR  state root shared with the CLI
- *   SUBAGENTS_AGENT_DIR  Pi agent dir used only for the copied-skill fallback
  *   SUBAGENTS_WAKE       "0" to inject without waking an idle lead (default: wake)
  *   SUBAGENTS_WATCH_MS   poll interval in ms (default 3000)
  */
@@ -35,16 +34,15 @@ const DELIVERED_RETENTION_MS = 7 * 24 * 60 * 60_000;
 
 type CompletionEvent = {
 	id: string;
-	role: string;
 	status: string;
 	reportPath: string;
 	reportBody?: string;
 	incarnation?: string;
 };
 
-function completionEventId({ id, role, status, reportPath, incarnation }: CompletionEvent): string {
+function completionEventId({ id, status, reportPath, incarnation }: CompletionEvent): string {
 	return createHash("sha256")
-		.update(JSON.stringify({ id, role, status, reportPath, incarnation }))
+		.update(JSON.stringify({ id, status, reportPath, incarnation }))
 		.digest("hex");
 }
 
@@ -121,9 +119,9 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	const parseEventLine = (line: string): CompletionEvent | null => {
-		const [id, role, status, reportPath] = line.split("\t");
+		const [id, status, reportPath] = line.split("\t");
 		if (!id || !reportPath) return null;
-		return { id, role: role || "?", status: status || "done", reportPath };
+		return { id, status: status || "done", reportPath };
 	};
 
 	const snapshotEvent = (event: CompletionEvent): CompletionEvent => {
@@ -221,11 +219,11 @@ export default function (pi: ExtensionAPI) {
 			type?: unknown;
 			customType?: unknown;
 			details?: unknown;
-			message?: { role?: unknown; customType?: unknown; details?: unknown };
+			message?: { customType?: unknown; details?: unknown };
 		};
 		const custom = record.type === "custom_message"
 			? record
-			: record.type === "message" && record.message?.role === "custom"
+			: record.type === "message" && record.message?.customType === "subagent-report"
 				? record.message
 				: null;
 		if (!custom || custom.customType !== "subagent-report") return null;
@@ -312,7 +310,7 @@ export default function (pi: ExtensionAPI) {
 	const attemptDelivery = (input: CompletionEvent): void => {
 		if (!active) return;
 		const event = snapshotEvent(input);
-		const { id, role, status, reportPath, reportBody = "" } = event;
+		const { id, status, reportPath, reportBody = "" } = event;
 		const eventId = completionEventId(event);
 		if (isDelivered(eventId)) {
 			confirmDelivery(eventId);
@@ -329,7 +327,7 @@ export default function (pi: ExtensionAPI) {
 			: status === "idle" ? "is idle — may have answered inline or need input"
 			: status;
 		const content =
-			`📋 subagent #${id} (${role}) ${label}.\n\n` +
+			`📋 subagent #${id} ${label}.\n\n` +
 			`${preview || "(no report captured)"}\n\n` +
 			`(full report: ${reportPath}${truncated ? "; preview truncated above" : ""}` +
 			` — peek: subagents peek ${id}, follow up: subagents tell ${id} <msg>)`;
@@ -341,7 +339,7 @@ export default function (pi: ExtensionAPI) {
 					customType: "subagent-report",
 					content,
 					display: true,
-					details: { id, role, status, reportPath, eventId },
+					details: { id, status, reportPath, eventId },
 				},
 				{ deliverAs: "steer", triggerTurn: wake },
 			);
@@ -427,7 +425,6 @@ export default function (pi: ExtensionAPI) {
 			}
 			if (
 				typeof parsed.id !== "string" ||
-				typeof parsed.role !== "string" ||
 				typeof parsed.status !== "string" ||
 				typeof parsed.reportPath !== "string" ||
 				(parsed.reportBody !== undefined && typeof parsed.reportBody !== "string") ||

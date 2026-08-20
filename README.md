@@ -1,16 +1,17 @@
 # pi-subagents
 
-A tmux-based subagent runner for the Pi coding agent. It packages three pieces:
+A tmux-based worker runner for the Pi coding agent. It packages three pieces:
 
 - `skills/subagents/subagents`: the reusable Bash CLI and on-disk protocol
 - `skills/subagents/SKILL.md`: instructions Pi can load on demand
 - `extensions/subagents-watch.ts`: optional push delivery of completed reports
 
-The repository contains no roles, prompts, model choices, credentials, or
-machine-generated state. You provide role files locally.
+The repository contains no worker prompts, model defaults, credentials, or
+machine-generated state. The spawning agent chooses a model when needed and
+supplies the complete worker brief directly as the task text.
 
-> Pi packages execute with your user permissions. Review the CLI, role prompts,
-> and extension before installing them.
+> Pi packages execute with your user permissions. Review the CLI, skill, and
+> extension before installing them.
 
 ## Requirements
 
@@ -18,7 +19,7 @@ machine-generated state. You provide role files locally.
 - Bash 3.2 or later
 - tmux; the lead Pi process and every CLI command must run inside the same tmux
   session
-- standard Unix tools: `awk`, `sed`, `grep`, `cksum`, `od`, `stat`, and `tail`
+- standard Unix tools: `awk`, `grep`, `cksum`, `od`, `stat`, and `tail`
 
 The watcher has no third-party runtime dependency. It uses Node built-ins and
 Pi's provided `@earendil-works/pi-coding-agent` package.
@@ -57,11 +58,9 @@ or credentials. The CLI and watcher must resolve the same state directory.
 | --- | --- | --- | --- |
 | `SUBAGENTS_STATE_DIR` | CLI, watcher | `${XDG_STATE_HOME:-$HOME/.local/state}/subagents` | Exact state root. Prefer this when moving state. |
 | `XDG_STATE_HOME` | CLI, watcher | `$HOME/.local/state` | Base used only when `SUBAGENTS_STATE_DIR` is unset. |
-| `SUBAGENTS_AGENT_DIR` | CLI, watcher | `$HOME/.pi/agent` | Base for the default role directory and copied-skill CLI fallback. |
-| `SUBAGENTS_ROLE_DIRS` | CLI | `$SUBAGENTS_AGENT_DIR/agents:$PWD/.pi/agents` | Colon-separated role search path; first matching filename wins. |
 | `SUBAGENTS_PI` | CLI | `pi` | Trusted launcher command, optionally an auth wrapper followed by `pi`. |
-| `SUBAGENTS_BIN` | watcher | package-local CLI, then `$SUBAGENTS_AGENT_DIR/skills/subagents/subagents` | Explicit executable CLI path. |
-| `SUBAGENTS_WINDOW_NAME` | CLI | `subagents` | tmux window name/prefix used for agent panes. |
+| `SUBAGENTS_BIN` | watcher | package-local CLI | Explicit executable CLI path. |
+| `SUBAGENTS_WINDOW_NAME` | CLI | `subagents` | tmux window name/prefix used for worker panes. |
 | `SUBAGENTS_WAKE` | watcher | `1` | Set to `0` to inject reports without waking an idle lead. |
 | `SUBAGENTS_WATCH_MS` | watcher | `3000` | Poll interval in milliseconds. Invalid/zero values use 3000. |
 
@@ -77,81 +76,73 @@ server environments can outlive the shell that created them.
 export SUBAGENTS_PI="$HOME/bin/with-provider-auth pi"
 ```
 
-The wrapper is used both for `doctor`'s live model probe and for interactive
-subagent panes. It should inject authentication into the child process and then
-`exec` its arguments. Keep the wrapper and secrets outside this repository.
+The wrapper is used for interactive worker panes. It should inject
+authentication into the child process and then `exec` its arguments. Keep the
+wrapper and secrets outside this repository.
 
 For compatibility with existing wrappers, `SUBAGENTS_PI` is treated as a
 trusted shell command and intentionally word-split. Shell quoting embedded
 inside the variable is not a portable argument parser, and command paths with
-spaces are unsupported. Do not set this variable from untrusted input. Tasks
-and generated prompt paths are separately shell-quoted before tmux launches
-Pi.
+spaces are unsupported. Do not set this variable from untrusted input. Tasks,
+model ids, effort values, and generated prompt paths are separately shell-quoted
+before tmux launches Pi.
 
-## Roles and models
+## Tasks and models
 
-No roles ship with this package. A role is `<role-name>.md` in one of
-`SUBAGENTS_ROLE_DIRS`. It may have simple YAML-like frontmatter; only scalar
-`model` and `tools` fields are read. The remaining Markdown becomes an appended
-system prompt.
+Start a worker with a complete brief:
 
-```markdown
----
-name: implement
-model: anthropic/claude-sonnet-4-6
-tools: read, bash, edit, write
----
-
-Implement the assigned task in the current working directory. Verify the result
-and report exactly what changed.
+```bash
+subagents run "Inspect the parser, fix the reported bug, run its focused tests, and report changed files and results."
 ```
 
-- Role names come from filenames, not the optional `name` field.
-- `model` should be a provider-qualified `provider/model` id. Omit it or use
-  `inherit` to use the launcher's current default; `doctor` cannot auth-probe an
-  inherited model.
-- `subagents run -m provider/model role task...` overrides the role model.
-- `tools` accepts `a, b` or `[a, b]`. The CLI always adds `write` so the required
-  report can be saved.
-- Frontmatter parsing is deliberately minimal, not a full YAML parser. Avoid
-  nested values, comments on field lines, or multiline `model`/`tools` values.
-- Role prompts are trusted instructions with access to the selected tools. Do
-  not store secrets in them.
+The brief must include all context the worker needs: the objective, relevant
+paths and facts, constraints, expected verification, and any shipping
+requirements. Workers start with discovery of context files, extensions,
+skills, and prompt templates disabled. They still receive Pi's normal coding
+prompt, built-in tools, the task text, and the generated report protocol.
 
-List effective roles and models with `subagents roles`. Run `subagents doctor`
-to validate qualified model ids and perform one live, minimal auth request per
-unique pinned model.
+By default, the CLI omits a model flag so the new Pi process uses the launcher's
+current/default model. The spawning agent can choose a provider-qualified model
+explicitly:
+
+```bash
+subagents run -m anthropic/claude-sonnet-4-6 "<complete task brief>"
+subagents run --model openai/gpt-5.4 --effort high "<complete task brief>"
+```
 
 ## CLI workflow
 
 ```bash
 subagents doctor
-subagents run implement "Make the requested change and verify it"
+subagents run "Make the requested change, verify it, and report the result"
 subagents tell 1 "Use the existing parser rather than adding a dependency"
 subagents status
 subagents peek 1 60
 subagents stop 1
 ```
 
-`run` creates or reuses one tmux window and tiles one pane per agent. Each pane
-starts Pi with extensions, skills, prompt templates, and session persistence
-disabled. It appends the selected role prompt and a generated protocol prompt.
+`run` creates or reuses one tmux window and tiles one pane per worker. Each pane
+starts an ephemeral Pi session with external resources and discovered context
+files disabled. The task is the initial user message; a generated system-prompt
+appendix contains only the report protocol.
 
-The protocol tells each agent to:
+The protocol tells each worker to:
 
-1. overwrite its assigned `result.md` with a complete report;
-2. print a line containing only `@@DONE@@`;
-3. wait for a follow-up task.
+1. treat the launch task as its complete brief and follow later messages as
+   additional or replacement instructions;
+2. overwrite its assigned `result.md` with a complete report;
+3. print a line containing only `@@DONE@@`;
+4. wait for a follow-up task.
 
 Completion detection primarily keys on changes to `result.md`. The sentinel is
 part of the behavioral protocol; the CLI also has idle/exited fallbacks for
-agents that fail to write a report.
+workers that fail to write a report.
 
 ### Push and pull delivery
 
-With `subagents-watch` loaded, use push mode: start agents and end the lead turn.
-The watcher drains `subagents events`, durably spools the report, injects a
-`subagent-report` custom message, and wakes Pi unless `SUBAGENTS_WAKE=0`.
+With `subagents-watch` loaded, use push mode: start workers and end the lead
+turn. The watcher drains `subagents events`, durably spools each report, injects
+a `subagent-report` custom message, and wakes Pi unless `SUBAGENTS_WAKE=0`.
 
 Without the watcher, use `subagents wait <id>` or `subagents reap`. Do not run
 those pull consumers while expecting watcher delivery because completion events
@@ -177,19 +168,17 @@ $SUBAGENTS_STATE_DIR/
         ├── birth                  # random run/incarnation token
         ├── pane                   # tmux pane id
         ├── sid                    # tmux session id
-        ├── role                   # selected role name
-        ├── role.md                # copied role body
         ├── protocol.md            # generated report protocol
-        ├── task                   # original task text
+        ├── task                   # original complete task brief
         ├── result.md              # mutable current report
         ├── reports/               # immutable completion snapshots
         └── detection markers      # hashes/counters used by events/wait
 ```
 
-Tasks, role bodies, pane captures, and reports may contain sensitive project
-information. Protect the state directory accordingly and clean orphaned tmux
-session directories when they are no longer needed. `subagents stop` removes an
-agent directory; watcher delivery markers are retained for seven days.
+Tasks, pane captures, and reports may contain sensitive project information.
+Protect the state directory accordingly and clean orphaned tmux session
+directories when they are no longer needed. `subagents stop` removes a worker
+directory; watcher delivery markers are retained for seven days.
 
 ## Known Pi and platform coupling
 
@@ -197,22 +186,22 @@ The reusable protocol and tmux orchestration are generic, but this version is
 still intentionally coupled in these places:
 
 - The launcher assumes Pi's current CLI flags (`--append-system-prompt`,
-  `--no-extensions`, `--no-skills`, `--no-prompt-templates`, tool/model/thinking
-  flags) and its interactive Enter-to-submit behavior.
+  `--no-extensions`, `--no-skills`, `--no-prompt-templates`,
+  `--no-context-files`, model/thinking flags) and its interactive
+  Enter-to-submit behavior.
 - The watcher imports Pi's `ExtensionAPI`, uses `sendMessage` with
-  `deliverAs: "steer"`, and recognizes Pi's persisted `custom_message` and v3
-  `message.role === "custom"` session records for delivery acknowledgement.
+  `deliverAs: "steer"`, and recognizes Pi's persisted legacy and v3 custom
+  session-message records for delivery acknowledgement.
 - Idle detection filters text from Pi's current terminal banner. It is a
   fallback and may need updates when Pi's TUI changes.
 - Recursive `fs.watch` is used for low-latency notifications where the platform
   supports it. The polling interval remains the portability and reliability
   fallback.
 - tmux session ids scope state. Moving a running lead between tmux sessions does
-  not migrate agents or state.
+  not migrate workers or state.
 
-The previous dotfiles-only watcher fallback has been removed. The standalone
-watcher checks `SUBAGENTS_BIN`, this package's own CLI, and the parameterized Pi
-agent directory only.
+The watcher checks `SUBAGENTS_BIN` first, then this package's own CLI. A copied
+watcher without the package-local CLI must set `SUBAGENTS_BIN` explicitly.
 
 ## Development checks
 
@@ -222,12 +211,13 @@ No install step is required on a recent Node release:
 bash -n skills/subagents/subagents
 node --experimental-strip-types --test tests/*.test.ts
 bash tests/cli-smoke.sh
+bash tests/public-safety.sh
 ```
 
-Or run all checks with `npm test` in an environment where npm is available.
-The tests cover environment/path resolution, package-local CLI discovery, role
-listing, CLI loading, and extension factory registration without starting tmux
-resources.
+Or run all checks with `npm test` in an environment where npm is available. The
+tests cover environment/path resolution, package-local CLI discovery, direct
+task launching with inherited and explicit models, extension factory
+registration, tmux smoke behavior, and public-package safety.
 
 ## License
 

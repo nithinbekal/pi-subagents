@@ -3,19 +3,16 @@
 # subagents — run helper agents in a dedicated tmux window and talk to them.
 #
 # Each subagent is an interactive `pi` running in its own pane of a tmux window
-# named "subagents". You hand a subagent a task, watch it work, send it
-# follow-ups (answers / steering / nudges), and collect its final report.
+# named "subagents". You hand a subagent a complete task brief, watch it work,
+# send follow-ups (answers / steering / nudges), and collect its final report.
 #
-# Subagents start with built-in tools only (--no-extensions) so they boot fast
-# and clean. The lead drives everything over tmux send-keys + capture-pane.
+# Subagents start with built-in tools only and without discovered context files,
+# extensions, skills, or prompt templates. The lead supplies all task context
+# directly and drives follow-ups over tmux send-keys + capture-pane.
 #
 # Launcher: subagents are started with `$SUBAGENTS_PI` (default "pi"). If your
 # model provider needs a wrapper command to inject auth, set SUBAGENTS_PI to a
 # trusted shell command such as `some-wrapper pi`.
-#
-# Roles: markdown files with optional YAML frontmatter (`model`, `tools`) whose
-# body becomes the subagent's system prompt. Looked up in $SUBAGENTS_ROLE_DIRS
-# (colon-separated), else $SUBAGENTS_AGENT_DIR/agents then ./.pi/agents.
 #
 # Session scoping: each tmux session gets its own subfolder under the state dir
 # (named after the tmux session id, e.g. <state>/$3/<id>/), so commands and the
@@ -23,29 +20,26 @@
 # spawned in other tmux sessions are invisible and protected.
 #
 # Usage:
-#   subagents config                    Print resolved launcher, state, role, and window configuration.
-#   subagents doctor                    Validate tmux/state layout, role models, and provider authentication.
-#   subagents run [-m MODEL] [--effort LEVEL] <role> <task...>
-#                                       Start a subagent from a role, give it the task. Prints its id.
-#                                       -m/--model overrides the role's model (use a provider-qualified
-#                                       id, e.g. anthropic/claude-sonnet-4-6). --effort sets the
-#                                       thinking level (off|minimal|low|medium|high|xhigh).
+#   subagents config                    Print resolved launcher, state, and window configuration.
+#   subagents doctor                    Validate the launcher, tmux, and state layout.
+#   subagents run [-m MODEL] [--effort LEVEL] <task...>
+#                                       Start a subagent with a complete task brief. Prints its id.
+#                                       -m/--model selects a provider-qualified model, e.g.
+#                                       anthropic/claude-sonnet-4-6. Without it, Pi's current/default
+#                                       model is inherited. --effort sets the thinking level.
 #   subagents tell <id> <message...>    Send a follow-up message to a subagent.
 #   subagents wait <id> [seconds]       Block until it finishes its task; print its report.
-#   subagents events                    Print NEW completion events as TSV (id\trole\tstatus\treportPath). Non-blocking. For the watcher extension.
+#   subagents events                    Print NEW completion events as TSV (id\tstatus\treportPath). Non-blocking. For the watcher extension.
 #   subagents reap                      Print any newly-finished reports (non-blocking, human-friendly).
 #   subagents status                    Show each subagent as working|idle|exited (non-blocking, no consume).
 #   subagents peek <id> [lines]         Show the tail of a subagent's pane (watch it work).
 #   subagents ls                        List active subagents.
 #   subagents stop <id|--all>           Shut a subagent (or all) down (window closes when empty).
-#   subagents roles                     List available role files.
 
 set -uo pipefail
 
 PI_CMD="${SUBAGENTS_PI:-pi}"
-PI_AGENT_DIR="${SUBAGENTS_AGENT_DIR:-$HOME/.pi/agent}"
 STATE_DIR="${SUBAGENTS_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/subagents}"
-ROLE_DIRS="${SUBAGENTS_ROLE_DIRS:-$PI_AGENT_DIR/agents:$PWD/.pi/agents}"
 WIN_PREFIX="${SUBAGENTS_WINDOW_NAME:-subagents}"
 SENTINEL="@@DONE@@"
 DEFAULT_WAIT=120
@@ -55,36 +49,6 @@ mkdir -p "$STATE_DIR"
 
 die() { echo "subagents: $*" >&2; exit 1; }
 in_tmux() { [ -n "${TMUX:-}" ]; }
-
-# ---- role files -----------------------------------------------------------
-
-role_file() {
-	local role="$1" dir f
-	IFS=: read -r -a dirs <<<"$ROLE_DIRS"
-	for dir in "${dirs[@]}"; do
-		f="$dir/$role.md"
-		[ -f "$f" ] && { echo "$f"; return 0; }
-	done
-	return 1
-}
-
-# Print the YAML frontmatter block (between the first two --- lines).
-_frontmatter() { awk 'NR==1 && $0=="---"{f=1;next} f && $0=="---"{exit} f{print}' "$1"; }
-
-# Get a scalar frontmatter field, stripped of quotes.
-fm_get() {
-	_frontmatter "$1" | sed -n "s/^$2:[[:space:]]*//p" | head -1 | sed "s/^[\"']//; s/[\"']$//"
-}
-
-# Print the role body (everything after the frontmatter, or the whole file).
-role_body() {
-	awk 'NR==1 && $0=="---"{infm=1;next} infm && $0=="---"{infm=0;next} !infm{print}' "$1"
-}
-
-# Normalize a tools value ("[a, b]" or "a, b") into "a,b".
-normalize_tools() {
-	echo "$1" | tr -d '[]' | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | grep -v '^$' | paste -sd, -
-}
 
 # ---- tmux window / pane helpers -------------------------------------------
 
@@ -245,9 +209,11 @@ write_protocol() { # result_path
 	cat <<EOF
 # Subagent protocol (important)
 
-You are an autonomous helper running in a tmux pane. A lead agent sends you a
-task and may send follow-up messages. Work autonomously; do not ask for
-confirmation on routine steps.
+You are an autonomous helper running in a tmux pane. The task text passed when
+you launch is your complete worker brief: it must contain all relevant context,
+constraints, paths, and expected verification. Follow that brief directly, work
+autonomously, and do not ask for confirmation on routine steps. A lead agent may
+send follow-up messages with additional or replacement instructions.
 
 The lead CANNOT see your screen. The only way it receives your work is the file
 below, so you MUST end every task by writing to it:
@@ -280,7 +246,7 @@ snapshot() { # id source-file-or-empty
 }
 
 # Detect a NEW completion for one subagent and print a TSV line:
-#   "<id>\t<role>\t<status>\t<reportPath>"   (status = done | idle | exited)
+#   "<id>\t<status>\t<reportPath>"   (status = done | idle | exited)
 # Returns 0 when an event was emitted, else 1. Idempotent: a given report is
 # emitted once (keyed on the result file's content hash). A per-subagent lock
 # serialises concurrent pollers (watcher extension + a manual `wait`) so the
@@ -297,12 +263,12 @@ detect_and_emit() { # id
 
 _emit_for() { # id  (runs holding $dir/.lock)
 	local id="$1" dir; dir=$(sadir "$id")
-	local pane role; pane=$(cat "$dir/pane"); role=$(cat "$dir/role" 2>/dev/null)
+	local pane; pane=$(cat "$dir/pane")
 
 	if ! pane_alive "$pane"; then
 		[ -f "$dir/.exited" ] && return 1
 		: >"$dir/.exited"
-		printf '%s\t%s\t%s\t%s\n' "$id" "$role" "exited" "$(snapshot "$id" "$dir/result.md")"
+		printf '%s\t%s\t%s\n' "$id" "exited" "$(snapshot "$id" "$dir/result.md")"
 		return 0
 	fi
 
@@ -316,7 +282,7 @@ _emit_for() { # id  (runs holding $dir/.lock)
 			printf '%s' "$curhash" >"$dir/rhash"
 			echo 0 >"$dir/stable"; echo 0 >"$dir/saw"
 			tmux capture-pane -p -t "$pane" 2>/dev/null | cksum >"$dir/rphash"
-			printf '%s\t%s\t%s\t%s\n' "$id" "$role" "done" "$(snapshot "$id" "$dir/result.md")"
+			printf '%s\t%s\t%s\n' "$id" "done" "$(snapshot "$id" "$dir/result.md")"
 			return 0
 		fi
 	fi
@@ -342,7 +308,7 @@ _emit_for() { # id  (runs holding $dir/.lock)
 			local n out; n=$(cat "$dir/revent" 2>/dev/null || echo 0); n=$((n + 1)); echo "$n" >"$dir/revent"
 			mkdir -p "$dir/reports"; out="$dir/reports/$n.md"
 			printf '%s\n' "$cap" | tail -40 >"$out"
-			printf '%s\t%s\t%s\t%s\n' "$id" "$role" "idle" "$out"
+			printf '%s\t%s\t%s\n' "$id" "idle" "$out"
 			return 0
 		fi
 	fi
@@ -357,26 +323,26 @@ provider_model() { # model -> true when provider-qualified
 	[ "$provider" != "$model" ] && [ -n "$provider" ] && [ -n "$model_id" ]
 }
 
-run_launcher() {
-	# Intentional word splitting: SUBAGENTS_PI may be a trusted wrapper plus `pi`.
-	# shellcheck disable=SC2086
-	$PI_CMD "$@"
-}
-
 cmd_config() {
 	printf 'launcher=%s\n' "$PI_CMD"
 	printf 'state_dir=%s\n' "$STATE_DIR"
-	printf 'role_dirs=%s\n' "$ROLE_DIRS"
-	printf 'agent_dir=%s\n' "$PI_AGENT_DIR"
 	printf 'window_name=%s\n' "$WIN_PREFIX"
 }
 
 cmd_doctor() {
-	local failures=0 warnings=0 orphan_sessions=0 legacy_dirs=0 sid root count dir name pane pane_sid role_file model provider
-	local i found probe_out role_dir role_name role_count=0 role_dir_count=0 seen_roles=""
-	local -a models=() model_roles=() dirs=()
+	local failures=0 warnings=0 orphan_sessions=0 legacy_dirs=0 sid root count dir name pane pane_sid launcher_bin
+	local -a launcher_parts=()
 	in_tmux || { echo "FAIL tmux: not in a tmux session"; return 1; }
 	sid=$(cur_sid); root=$(sr)
+
+	read -r -a launcher_parts <<<"$PI_CMD"
+	launcher_bin="${launcher_parts[0]:-}"
+	if [ -n "$launcher_bin" ] && command -v "$launcher_bin" >/dev/null 2>&1; then
+		echo "ok   launcher: $launcher_bin"
+	else
+		echo "FAIL launcher: command not found: ${launcher_bin:-<empty>}"
+		failures=$((failures + 1))
+	fi
 
 	count=$(subagents_windows "$sid" | awk 'NF{n++} END{print n+0}')
 	if [ "$count" -le 1 ]; then
@@ -428,7 +394,7 @@ cmd_doctor() {
 			echo "FAIL state: non-numeric agent dir $dir"
 			failures=$((failures + 1)); continue ;;
 		esac
-		if [ ! -s "$dir/pane" ] || [ ! -f "$dir/role" ] || [ ! -f "$dir/task" ] || [ ! -f "$dir/result.md" ]; then
+		if [ ! -s "$dir/birth" ] || [ ! -s "$dir/pane" ] || [ ! -s "$dir/sid" ] || [ ! -s "$dir/protocol.md" ] || [ ! -s "$dir/task" ] || [ ! -f "$dir/result.md" ]; then
 			echo "FAIL state: incomplete agent dir $dir"
 			failures=$((failures + 1)); continue
 		fi
@@ -443,60 +409,6 @@ cmd_doctor() {
 		fi
 	done
 	[ "$failures" -gt 0 ] || echo "ok   state: watcher-compatible layout at $root"
-
-	IFS=: read -r -a dirs <<<"$ROLE_DIRS"
-	for role_dir in "${dirs[@]}"; do
-		[ -d "$role_dir" ] || continue
-		role_dir_count=$((role_dir_count + 1))
-		for role_file in "$role_dir"/*.md; do
-			[ -f "$role_file" ] || continue
-			role_name=$(basename "$role_file" .md)
-			# Match role_file(): the first file with a given name wins.
-			printf '%s' "$seen_roles" | grep -Fqx "$role_name" && continue
-			seen_roles="${seen_roles}${role_name}"$'\n'
-			role_count=$((role_count + 1))
-			model=$(fm_get "$role_file" model)
-			if [ -z "$model" ] || [ "$model" = "inherit" ]; then
-				echo "WARN role: $(basename "$role_file") inherits the launcher model; auth not probed"
-				warnings=$((warnings + 1)); continue
-			fi
-			if ! provider_model "$model"; then
-				echo "FAIL role: $(basename "$role_file") model '$model' is not provider-qualified"
-				failures=$((failures + 1)); continue
-			fi
-			found=0
-			for ((i = 0; i < ${#models[@]}; i++)); do
-				if [ "${models[$i]}" = "$model" ]; then
-					model_roles[$i]="${model_roles[$i]},$role_name"
-					found=1; break
-				fi
-			done
-			if [ "$found" = 0 ]; then
-				models+=("$model"); model_roles+=("$role_name")
-			fi
-		done
-	done
-	if [ "$role_dir_count" = 0 ]; then
-		echo "FAIL roles: none of the configured directories exist: $ROLE_DIRS"
-		failures=$((failures + 1))
-	elif [ "$role_count" = 0 ]; then
-		echo "FAIL roles: no role files found in $ROLE_DIRS"
-		failures=$((failures + 1))
-	else
-		echo "ok   roles: $role_count effective role(s) from $ROLE_DIRS"
-	fi
-
-	for ((i = 0; i < ${#models[@]}; i++)); do
-		model=${models[$i]}; provider=${model%%/*}
-		if probe_out=$(run_launcher --no-extensions --no-skills --no-prompt-templates --no-context-files \
-			--no-session --no-tools --thinking off --model "$model" --print "Reply with OK only." 2>&1); then
-			echo "ok   auth: $provider (${model_roles[$i]})"
-		else
-			probe_out=$(printf '%s\n' "$probe_out" | grep -E 'No API key|not found|[Ee]rror|[Ff]ailed|[Uu]nauthorized' | tail -1)
-			echo "FAIL auth: $provider (${model_roles[$i]})${probe_out:+ — $probe_out}"
-			failures=$((failures + 1))
-		fi
-	done
 
 	if [ "$failures" -gt 0 ]; then
 		echo "doctor: $failures failure(s), $warnings warning(s)"
@@ -513,19 +425,23 @@ cmd_run() {
 	local model_override="" effort_override=""
 	while [ $# -gt 0 ]; do
 		case "$1" in
-			-m|--model) model_override="${2:-}"; shift 2 || die "-m needs a value" ;;
-			--effort) effort_override="${2:-}"; shift 2 || die "--effort needs a value" ;;
+			-m|--model)
+				[ $# -ge 2 ] && [ -n "$2" ] || die "$1 needs a value"
+				model_override="$2"; shift 2 ;;
+			--effort)
+				[ $# -ge 2 ] && [ -n "$2" ] || die "--effort needs a value"
+				effort_override="$2"; shift 2 ;;
 			--) shift; break ;;
 			-*) die "unknown option '$1'" ;;
 			*) break ;;
 		esac
 	done
-	local role="${1:-}"; shift || true
 	local task="$*"
-	[ -n "$role" ] && [ -n "$task" ] || die "usage: subagents run [-m MODEL] [--effort LEVEL] <role> <task...>"
+	[ -n "$task" ] || die "usage: subagents run [-m MODEL] [--effort LEVEL] <task...>"
 	in_tmux || die "subagents requires tmux"
-
-	local rf; rf=$(role_file "$role") || die "role '$role' not found (try: subagents roles)"
+	if [ -n "$model_override" ] && ! provider_model "$model_override"; then
+		die "model '$model_override' is not provider-qualified (expected provider/model)"
+	fi
 
 	local sess; sess=$(cur_sid)
 	local id; id=$(reserve_id) || die "failed to reserve subagent id"
@@ -540,36 +456,23 @@ cmd_run() {
 		|| { rm -rf "$dir"; die "could not create subagent incarnation token"; }
 	[ -s "$dir/birth" ] || { rm -rf "$dir"; die "could not create subagent incarnation token"; }
 
-	role_body "$rf" >"$dir/role.md"
 	write_protocol "$result" >"$dir/protocol.md"
 
-	local model tools modelflag="" toolsflag="" thinkflag=""
-	# model precedence: -m flag > role frontmatter > launcher default
-	model=$(fm_get "$rf" model)
-	[ -n "$model_override" ] && model="$model_override"
-	tools=$(fm_get "$rf" tools)
-	if [ -n "$model" ] && [ "$model" != "inherit" ] && ! provider_model "$model"; then
-		rm -rf "$dir"
-		die "model '$model' is not provider-qualified (expected provider/model)"
-	fi
-	[ -n "$model" ] && [ "$model" != "inherit" ] && modelflag="--model $model"
-	[ -n "$effort_override" ] && thinkflag="--thinking $effort_override"
-	if [ -n "$tools" ]; then
-		# always allow `write` so the subagent can produce its report file
-		toolsflag="--tools $(normalize_tools "$tools"),write"
-	fi
-
-	local q_pwd q_role q_proto q_task
+	local q_pwd q_proto q_task q_model q_effort
 	q_pwd=$(printf %q "$PWD")
-	q_role=$(printf %q "$dir/role.md")
 	q_proto=$(printf %q "$dir/protocol.md")
-	q_task=$(printf %q "${task//$'\n'/ }")
+	q_task=$(printf %q "$task")
 
-	local picmd="cd $q_pwd && exec $PI_CMD --no-extensions --no-skills --no-prompt-templates --no-session"
-	[ -n "$modelflag" ] && picmd="$picmd $modelflag"
-	[ -n "$thinkflag" ] && picmd="$picmd $thinkflag"
-	[ -n "$toolsflag" ] && picmd="$picmd $toolsflag"
-	picmd="$picmd --append-system-prompt $q_role --append-system-prompt $q_proto $q_task"
+	local picmd="cd $q_pwd && exec $PI_CMD --no-extensions --no-skills --no-prompt-templates --no-context-files --no-session"
+	if [ -n "$model_override" ]; then
+		q_model=$(printf %q "$model_override")
+		picmd="$picmd --model $q_model"
+	fi
+	if [ -n "$effort_override" ]; then
+		q_effort=$(printf %q "$effort_override")
+		picmd="$picmd --thinking $q_effort"
+	fi
+	picmd="$picmd --append-system-prompt $q_proto $q_task"
 
 	local pane
 	if ! pane=$(create_subagent_pane "$sess" "$picmd") || [ -z "$pane" ]; then
@@ -579,14 +482,13 @@ cmd_run() {
 
 	echo "$pane" >"$dir/pane"
 	printf '%s\n' "$(cur_sid)" >"$dir/sid"
-	echo "$role" >"$dir/role"
-	echo "$task" >"$dir/task"
+	printf '%s\n' "$task" >"$dir/task"
 	echo 0 >"$dir/rcount"
 	echo 0 >"$dir/rmtime"
 	date +%s >"$dir/sent"
-	tmux select-pane -t "$pane" -T "subagent#$id $role" 2>/dev/null || true
+	tmux select-pane -t "$pane" -T "subagent#$id" 2>/dev/null || true
 
-	echo "started subagent #$id ($role) — pane $pane, model ${model:-inherited}${effort_override:+, effort $effort_override}"
+	echo "started subagent #$id — pane $pane, model ${model_override:-inherited}${effort_override:+, effort $effort_override}"
 	echo "  report:  pushed by subagents-watch — end your turn"
 	echo "  answer:  subagents tell $id <message>"
 	echo "  fallback without watcher: subagents wait $id"
@@ -611,7 +513,7 @@ cmd_wait() {
 	local i line status path
 	for ((i = 0; i < secs; i += 2)); do
 		if line=$(detect_and_emit "$id") && [ -n "$line" ]; then
-			IFS=$'\t' read -r _ _ status path <<<"$line"
+			IFS=$'\t' read -r _ status path <<<"$line"
 			echo "=== subagent #$id report ($status) ==="
 			[ -s "$path" ] && cat "$path" || echo "(no report captured)"
 			return 0
@@ -636,11 +538,11 @@ cmd_events() {
 
 # Human-friendly drain of newly-finished reports.
 cmd_reap() {
-	local any=0 id role status path
-	while IFS=$'\t' read -r id role status path; do
+	local any=0 id status path
+	while IFS=$'\t' read -r id status path; do
 		[ -n "$id" ] || continue
 		any=1
-		echo "=== subagent #$id ($role) — $status ==="
+		echo "=== subagent #$id — $status ==="
 		[ -s "$path" ] && cat "$path" || echo "(no report captured)"
 		echo
 	done < <(cmd_events)
@@ -649,11 +551,11 @@ cmd_reap() {
 
 # Non-blocking live status of each subagent (does not consume events).
 cmd_status() {
-	local dir id pane role st found=0 h1 h2
+	local dir id pane st found=0 h1 h2
 	for dir in "$(sr)"/*/; do
 		[ -d "$dir" ] || continue
 		id=$(basename "$dir"); [ -f "$dir/pane" ] || continue
-		pane=$(cat "$dir/pane"); role=$(cat "$dir/role" 2>/dev/null)
+		pane=$(cat "$dir/pane")
 		if ! pane_alive "$pane"; then
 			st="exited"
 		else
@@ -661,7 +563,7 @@ cmd_status() {
 			h2=$(tmux capture-pane -p -t "$pane" 2>/dev/null | cksum)
 			[ "$h1" = "$h2" ] && st="idle" || st="working"
 		fi
-		printf "#%-3s %-14s %s\n" "$id" "$role" "$st"; found=1
+		printf "#%-3s %s\n" "$id" "$st"; found=1
 	done
 	[ "$found" = 1 ] || echo "no subagents"
 }
@@ -676,16 +578,15 @@ cmd_peek() {
 }
 
 cmd_ls() {
-	local dir id pane role st task found=0
+	local dir id pane st task found=0
 	for dir in "$(sr)"/*/; do
 		[ -d "$dir" ] || continue
 		id=$(basename "$dir")
 		[ -f "$dir/pane" ] || continue
 		pane=$(cat "$dir/pane")
-		role=$(cat "$dir/role" 2>/dev/null)
 		if pane_alive "$pane"; then st="alive"; else st="dead"; fi
 		task=$(head -c 64 "$dir/task" 2>/dev/null | tr '\n' ' ')
-		printf "#%-3s %-14s %-6s %s\n" "$id" "$role" "$st" "$task"
+		printf "#%-3s %-6s %s\n" "$id" "$st" "$task"
 		found=1
 	done
 	[ "$found" = 1 ] || echo "no subagents"
@@ -714,21 +615,6 @@ cmd_stop() {
 	fi
 }
 
-cmd_roles() {
-	local dir f name model
-	IFS=: read -r -a dirs <<<"$ROLE_DIRS"
-	for dir in "${dirs[@]}"; do
-		[ -d "$dir" ] || continue
-		echo "# $dir"
-		for f in "$dir"/*.md; do
-			[ -f "$f" ] || continue
-			name=$(basename "$f" .md)
-			model=$(fm_get "$f" model)
-			printf "  %-20s %s\n" "$name" "${model:+($model)}"
-		done
-	done
-}
-
 usage() { awk 'NR>1 && /^#/{sub(/^# ?/,""); print; next} NR>1 && !/^#/{exit}' "$0"; }
 
 # ---- dispatch -------------------------------------------------------------
@@ -746,7 +632,6 @@ case "$cmd" in
 	peek)      cmd_peek  "$@" ;;
 	ls|list)   cmd_ls    "$@" ;;
 	stop|kill) cmd_stop  "$@" ;;
-	roles)     cmd_roles "$@" ;;
 	""|-h|--help|help) usage ;;
 	*) die "unknown command '$cmd' (try: subagents --help)" ;;
 esac

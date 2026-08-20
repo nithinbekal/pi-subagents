@@ -1,40 +1,39 @@
 ---
 name: subagents
 description: >-
-  Delegate focused tasks to isolated Pi agents in tmux panes, send follow-up
-  messages, and collect completion reports. Use for parallel or context-heavy
-  work when tmux and at least one local role file are configured.
+  Delegate complete task briefs to isolated Pi agents in tmux panes, send
+  follow-up messages, and collect completion reports. Use for parallel or
+  context-heavy work when Pi is running inside tmux.
 compatibility: Requires bash, tmux, and the Pi coding-agent CLI.
 ---
 
 # Subagents
 
 Run focused Pi agents in a dedicated tmux window. Each agent has an isolated
-context and a pane title of `subagent#<id> <role>`. The lead communicates through
-the CLI and receives reports through the watcher extension or pull commands.
+context and a pane title of `subagent#<id>`. The lead communicates through the
+CLI and receives reports through the watcher extension or pull commands.
 
 Resolve the executable beside this file and invoke it by absolute path. The
 examples below use `subagents` for readability.
 
 ## Before delegating
 
-1. Run `subagents roles`; role names are filenames from the configured role
-   directories. Do not invent a role name.
-2. Run `subagents doctor` after installation or configuration changes. Fix each
-   `FAIL`; warnings usually identify inherited models or stale state.
-3. Choose a role whose prompt and tools fit the task. `run -m provider/model`
-   may override its configured model.
-
-This package intentionally supplies no roles or model defaults. See the package
-README for role format and `SUBAGENTS_ROLE_DIRS` configuration.
+1. Run `subagents doctor` after installation or configuration changes. Fix each
+   `FAIL`; warnings identify stale state.
+2. Write the task as a complete worker brief. Include the objective, relevant
+   paths and context, constraints, expected verification, and reporting or
+   shipping requirements. Workers do not inherit the lead's conversation or
+   discovered context files.
+3. Usually omit `-m` so the new Pi process uses the launcher's current/default
+   model. Pass `-m provider/model` only when the spawning agent deliberately
+   chooses another model.
 
 ## Commands
 
 ```bash
 subagents config
 subagents doctor
-subagents roles
-subagents run [-m provider/model] [--effort LEVEL] <role> "<task>"
+subagents run [-m provider/model] [--effort LEVEL] "<complete task brief>"
 subagents tell <id> "<message>"
 subagents status
 subagents peek <id> [lines]
@@ -44,8 +43,8 @@ subagents wait <id> [seconds]
 subagents reap
 ```
 
-`--effort` accepts Pi's thinking levels. Use provider-qualified model ids to
-avoid ambiguity.
+`--effort` accepts Pi's thinking levels. Model ids must be provider-qualified.
+When `-m`/`--model` is absent, the CLI deliberately passes no model flag.
 
 ## Push workflow (watcher loaded)
 
@@ -70,11 +69,11 @@ finished agents. On timeout or idle, inspect once with `peek`, answer with
 
 - Every command and watcher instance is scoped to the current tmux session.
 - The CLI starts subagents with `--no-extensions --no-skills
-  --no-prompt-templates --no-session`; role tools and the built-in Pi tools are
-  the available capabilities.
-- The role protocol requires the subagent to overwrite its assigned
+  --no-prompt-templates --no-context-files --no-session`; Pi's built-in tools
+  remain available.
+- The report protocol requires the subagent to overwrite its assigned
   `result.md`, print `@@DONE@@`, and wait for follow-up work.
 - `SUBAGENTS_PI` may name a trusted auth wrapper plus `pi`. Never put credentials
-  directly in role files, tasks, package configuration, or state.
+  directly in task briefs, package configuration, or state.
 - See the package README for all environment variables, state layout, tmux
   requirements, and known Pi coupling.

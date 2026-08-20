@@ -37,12 +37,11 @@ type CompletionEvent = {
 	status: string;
 	reportPath: string;
 	reportBody?: string;
-	incarnation?: string;
 };
 
-function completionEventId({ id, status, reportPath, incarnation }: CompletionEvent): string {
+function completionEventId({ id, status, reportPath }: CompletionEvent): string {
 	return createHash("sha256")
-		.update(JSON.stringify({ id, status, reportPath, incarnation }))
+		.update(JSON.stringify({ id, status, reportPath }))
 		.digest("hex");
 }
 
@@ -134,19 +133,7 @@ export default function (pi: ExtensionAPI) {
 				/* report file may be gone if the subagent was stopped */
 			}
 		}
-
-		let incarnation = event.incarnation;
-		if (incarnation === undefined) {
-			// Legacy agents have no birth token. Snapshot the immutable report file's
-			// identity now; never read a future run's birth file at the reused path.
-			try {
-				const stat = fs.statSync(event.reportPath);
-				incarnation = `legacy-report:${stat.dev}:${stat.ino}:${stat.mtimeMs}:${stat.size}`;
-			} catch {
-				incarnation = `legacy-event:${randomUUID()}`;
-			}
-		}
-		return { ...event, reportBody, incarnation };
+		return { ...event, reportBody };
 	};
 
 	const deliveredPath = (eventId: string): string | null =>
@@ -427,8 +414,7 @@ export default function (pi: ExtensionAPI) {
 				typeof parsed.id !== "string" ||
 				typeof parsed.status !== "string" ||
 				typeof parsed.reportPath !== "string" ||
-				(parsed.reportBody !== undefined && typeof parsed.reportBody !== "string") ||
-				(parsed.incarnation !== undefined && typeof parsed.incarnation !== "string")
+				(parsed.reportBody !== undefined && typeof parsed.reportBody !== "string")
 			) {
 				quarantineCorruptEvent(queuedPath);
 				continue;

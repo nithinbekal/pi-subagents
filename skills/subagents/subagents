@@ -134,8 +134,8 @@ seq_lock_is_stale() { # lock-dir -> true when old enough and owner is dead/missi
 }
 
 # Reserve a monotonically increasing id. The persistent counter survives
-# `stop`/`stop --all`, so a later subagent never reuses an earlier incarnation's
-# id. The lock serializes concurrent launchers; gaps after crashes are harmless.
+# `stop`/`stop --all`, so a later subagent never reuses an earlier subagent's id.
+# The lock serializes concurrent launchers; gaps after crashes are harmless.
 reserve_id() {
 	local root lock attempts=0 seq max dir name candidate tmp q_lock stale owner_pid
 	root=$(sr); lock="$root/.seq.lock"
@@ -394,7 +394,7 @@ cmd_doctor() {
 			echo "FAIL state: non-numeric agent dir $dir"
 			failures=$((failures + 1)); continue ;;
 		esac
-		if [ ! -s "$dir/birth" ] || [ ! -s "$dir/pane" ] || [ ! -s "$dir/sid" ] || [ ! -s "$dir/protocol.md" ] || [ ! -s "$dir/task" ] || [ ! -f "$dir/result.md" ]; then
+		if [ ! -s "$dir/pane" ] || [ ! -s "$dir/sid" ] || [ ! -s "$dir/protocol.md" ] || [ ! -s "$dir/task" ] || [ ! -f "$dir/result.md" ]; then
 			echo "FAIL state: incomplete agent dir $dir"
 			failures=$((failures + 1)); continue
 		fi
@@ -450,12 +450,6 @@ cmd_run() {
 	[ -d "$dir" ] || die "failed to reserve subagent id"
 	local result="$dir/result.md"
 	: >"$result"
-	# Immutable run token used by the watcher in its durable delivery id. This
-	# also protects against legacy/manual id reuse and tmux session-id reuse.
-	LC_ALL=C od -An -N16 -tx1 /dev/urandom | tr -d ' \n' >"$dir/birth" \
-		|| { rm -rf "$dir"; die "could not create subagent incarnation token"; }
-	[ -s "$dir/birth" ] || { rm -rf "$dir"; die "could not create subagent incarnation token"; }
-
 	write_protocol "$result" >"$dir/protocol.md"
 
 	local q_pwd q_proto q_task q_model q_effort
@@ -483,9 +477,6 @@ cmd_run() {
 	echo "$pane" >"$dir/pane"
 	printf '%s\n' "$(cur_sid)" >"$dir/sid"
 	printf '%s\n' "$task" >"$dir/task"
-	echo 0 >"$dir/rcount"
-	echo 0 >"$dir/rmtime"
-	date +%s >"$dir/sent"
 	tmux select-pane -t "$pane" -T "subagent#$id" 2>/dev/null || true
 
 	echo "started subagent #$id — pane $pane, model ${model_override:-inherited}${effort_override:+, effort $effort_override}"
@@ -501,7 +492,6 @@ cmd_tell() {
 	local dir; dir=$(sadir "$id"); [ -d "$dir" ] || die "no subagent #$id"
 	local pane; pane=$(cat "$dir/pane")
 	pane_alive "$pane" || die "subagent #$id is not running"
-	date +%s >"$dir/sent"
 	send_pane "$pane" "$msg"
 	echo "sent to subagent #$id"
 }

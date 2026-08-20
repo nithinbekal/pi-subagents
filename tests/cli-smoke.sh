@@ -115,7 +115,7 @@ AGENT_DIR=${TASK_FILE%/task}
 grep -Fqx 'Inspect the target, implement safely, verify, and report for inherit-smoke' "$AGENT_DIR/task"
 grep -Fq 'complete worker brief' "$AGENT_DIR/protocol.md"
 grep -Fq '@@DONE@@' "$AGENT_DIR/protocol.md"
-for state_file in birth pane protocol.md result.md sid task; do
+for state_file in pane protocol.md result.md sid task; do
 	[ -e "$AGENT_DIR/$state_file" ]
 done
 

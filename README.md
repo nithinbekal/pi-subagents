@@ -19,7 +19,7 @@ supplies the complete worker brief directly as the task text.
 - Bash 3.2 or later
 - tmux; the lead Pi process and every CLI command must run inside the same tmux
   session
-- standard Unix tools: `awk`, `grep`, `cksum`, `od`, `stat`, and `tail`
+- standard Unix tools: `awk`, `grep`, `cksum`, `stat`, and `tail`
 
 The watcher has no third-party runtime dependency. It uses Node built-ins and
 Pi's provided `@earendil-works/pi-coding-agent` package.
@@ -165,7 +165,6 @@ $SUBAGENTS_STATE_DIR/
     ├── .watcher-pending/          # immutable JSON report spool
     ├── .watcher-delivered/        # delivery acknowledgement ledger
     └── 1/
-        ├── birth                  # random run/incarnation token
         ├── pane                   # tmux pane id
         ├── sid                    # tmux session id
         ├── protocol.md            # generated report protocol

@@ -20,7 +20,7 @@
     "subagents": "skills/subagents/subagents"
   },
   "scripts": {
-    "test": "bash -n skills/subagents/subagents && node --experimental-strip-types --test tests/config.test.ts && bash tests/cli-smoke.sh && bash tests/public-safety.sh"
+    "test": "bash -n skills/subagents/subagents tests/*.sh && node --experimental-strip-types --test tests/config.test.ts && bash tests/cli-smoke.sh && bash tests/cli-reliability.sh && bash tests/public-safety.sh"
   },
   "pi": {
     "extensions": [

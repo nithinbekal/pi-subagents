@@ -1,16 +1,14 @@
 /**
  * Subagents Watcher (lead-side, push-async)
  *
- * Turns the `subagents` skill into push mode: watches its state dir and injects
- * each newly-finished subagent report into the lead's conversation — waking the
- * lead — so you don't have to block in `subagents wait` or poll manually.
+ * Polls the session-scoped subagent state, asks the CLI to detect completions,
+ * and injects durably queued reports into the lead conversation. The CLI writes
+ * each immutable completion to the watcher spool before advancing its detection
+ * marker, so a watcher or callback crash cannot create a loss window.
  *
- * All detection lives in the CLI (`subagents events`, which prints NEW completion
- * events as TSV: id<TAB>status<TAB>reportPath and advances its detection
- * markers). This extension drains it on an interval + fs.watch and pushes via
- * pi.sendMessage(steer, triggerTurn). Late events are durably spooled for replay.
- *
- * Without this extension the skill still works in pull mode (wait/reap/status).
+ * Delivery is at least once. A spool record is removed only after the matching
+ * Pi 0.84+ custom_message entry is observed in the persisted session and a
+ * durable acknowledgement marker has been written.
  *
  * Env:
  *   SUBAGENTS_BIN        path to the subagents script (else package-local)
@@ -27,6 +25,7 @@ import * as path from "node:path";
 import { findSubagentsBin, resolveStateDir } from "./config.ts";
 
 const PREVIEW_CHARS = 1500;
+const DEFAULT_WATCH_MS = 3000;
 // Long enough that a queued steer can survive an unusually long turn without
 // same-instance retry spam. Reload still retries immediately from the spool.
 const DELIVERY_RETRY_MS = 30 * 60_000;
@@ -34,28 +33,33 @@ const DELIVERED_RETENTION_MS = 7 * 24 * 60 * 60_000;
 
 type CompletionEvent = {
 	id: string;
-	status: string;
+	status: "done" | "idle" | "exited";
 	reportPath: string;
-	reportBody?: string;
+	reportBody: string;
+	completionKey: string;
 };
 
-function completionEventId({ id, status, reportPath }: CompletionEvent): string {
+export function resolveWatchInterval(value: string | undefined): number {
+	const parsed = Number(value);
+	return Number.isFinite(parsed) && parsed >= 1 ? Math.floor(parsed) : DEFAULT_WATCH_MS;
+}
+
+function completionEventId({ id, status, completionKey }: CompletionEvent): string {
 	return createHash("sha256")
-		.update(JSON.stringify({ id, status, reportPath }))
+		.update(JSON.stringify({ id, status, completionKey }))
 		.digest("hex");
 }
 
-// Resolve lazily from session_start rather than blocking every extension factory
-// load. Prefer $TMUX_PANE (the exact pane), then parse $TMUX.
-function currentSessionId(): string | null {
+// Prefer the exact pane, then parse tmux's stable session number from $TMUX.
+function currentTmuxSession(): string | null {
 	const pane = process.env.TMUX_PANE;
 	if (pane) {
 		try {
-			const sid = execFileSync("tmux", ["display-message", "-pt", pane, "#{session_id}"], {
+			const session = execFileSync("tmux", ["display-message", "-pt", pane, "#{session_id}"], {
 				encoding: "utf-8",
 				timeout: 2000,
 			}).trim();
-			if (sid) return sid;
+			if (session) return session;
 		} catch {
 			/* fall through to $TMUX parsing */
 		}
@@ -69,13 +73,22 @@ function currentSessionId(): string | null {
 	return null;
 }
 
+function fsyncDirectory(directory: string): void {
+	const descriptor = fs.openSync(directory, "r");
+	try {
+		fs.fsyncSync(descriptor);
+	} finally {
+		fs.closeSync(descriptor);
+	}
+}
+
 export default function (pi: ExtensionAPI) {
 	const bin = findSubagentsBin();
-	if (!bin) return; // skill not installed — nothing to watch
+	if (!bin) return;
 
 	const stateDir = resolveStateDir();
 	const wake = process.env.SUBAGENTS_WAKE !== "0";
-	const intervalMs = Number(process.env.SUBAGENTS_WATCH_MS) || 3000;
+	const intervalMs = resolveWatchInterval(process.env.SUBAGENTS_WATCH_MS);
 
 	let sessionDir: string | null = null;
 	let pendingDir: string | null = null;
@@ -88,21 +101,20 @@ export default function (pi: ExtensionAPI) {
 	let draining = false;
 	let pending = false;
 	let timer: ReturnType<typeof setInterval> | null = null;
-	let watcher: fs.FSWatcher | null = null;
 	let scheduledDrain: ReturnType<typeof setTimeout> | null = null;
 	let scheduledDrainAt = 0;
 	let drainPromise: Promise<void> | null = null;
 	let finishDrain: (() => void) | null = null;
 	const confirmedEventIds = new Set<string>();
 	const deliveryAttempts = new Map<string, number>();
-	const memoryEvents = new Map<string, CompletionEvent>();
-	const reportedSpoolErrors = new Set<string>();
+	const queuedPaths = new Map<string, Set<string>>();
+	const reportedErrors = new Set<string>();
 
-	const reportSpoolError = (operation: string, error: unknown): void => {
+	const reportError = (operation: string, error: unknown): void => {
 		const message = error instanceof Error ? error.message : String(error);
 		const key = `${operation}: ${message}`;
-		if (reportedSpoolErrors.has(key)) return;
-		reportedSpoolErrors.add(key);
+		if (reportedErrors.has(key)) return;
+		reportedErrors.add(key);
 		console.error(`[subagents-watch] ${key}`);
 	};
 
@@ -111,29 +123,10 @@ export default function (pi: ExtensionAPI) {
 		try {
 			return fs
 				.readdirSync(sessionDir, { withFileTypes: true })
-				.some((e) => e.isDirectory() && /^\d+$/.test(e.name));
+				.some((entry) => entry.isDirectory() && /^\d+$/.test(entry.name));
 		} catch {
 			return false;
 		}
-	};
-
-	const parseEventLine = (line: string): CompletionEvent | null => {
-		const [id, status, reportPath] = line.split("\t");
-		if (!id || !reportPath) return null;
-		return { id, status: status || "done", reportPath };
-	};
-
-	const snapshotEvent = (event: CompletionEvent): CompletionEvent => {
-		let reportBody = event.reportBody;
-		if (reportBody === undefined) {
-			reportBody = "";
-			try {
-				reportBody = fs.readFileSync(event.reportPath, "utf-8").trim().slice(0, PREVIEW_CHARS + 1);
-			} catch {
-				/* report file may be gone if the subagent was stopped */
-			}
-		}
-		return { ...event, reportBody };
 	};
 
 	const deliveredPath = (eventId: string): string | null =>
@@ -152,99 +145,98 @@ export default function (pi: ExtensionAPI) {
 		}
 	};
 
-	const queueEvent = (event: CompletionEvent): boolean => {
-		if (!pendingDir) return false;
-		const eventId = completionEventId(event);
-		const queuedPath = path.join(pendingDir, `${eventId}.json`);
-		let tempPath: string | null = null;
-		try {
-			fs.mkdirSync(pendingDir, { recursive: true });
-			if (fs.existsSync(queuedPath)) return true;
-			tempPath = path.join(pendingDir, `.${eventId}.${randomUUID()}.tmp`);
-			fs.writeFileSync(tempPath, JSON.stringify(event), "utf-8");
-			fs.renameSync(tempPath, queuedPath);
-			tempPath = null;
-			return true;
-		} catch (error) {
-			reportSpoolError(`could not spool event ${eventId}`, error);
-			if (tempPath) {
-				try { fs.unlinkSync(tempPath); } catch { /* ignore temp cleanup errors */ }
-			}
-			return false;
-		}
-	};
-
 	const markDelivered = (eventId: string): boolean => {
 		const marker = deliveredPath(eventId);
 		if (!marker || !deliveredDir) return false;
+		let descriptor: number | null = null;
 		try {
 			fs.mkdirSync(deliveredDir, { recursive: true });
 			try {
-				fs.writeFileSync(marker, `${Date.now()}\n`, { encoding: "utf-8", flag: "wx" });
+				descriptor = fs.openSync(marker, "wx", 0o600);
+				fs.writeFileSync(descriptor, `${Date.now()}\n`, "utf-8");
+				fs.fsyncSync(descriptor);
+				fs.closeSync(descriptor);
+				descriptor = null;
+				fsyncDirectory(deliveredDir);
 			} catch (error) {
 				if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
 			}
 			confirmedEventIds.add(eventId);
 			return true;
 		} catch (error) {
-			reportSpoolError(`could not record delivered event ${eventId}`, error);
+			if (descriptor !== null) {
+				try { fs.closeSync(descriptor); } catch { /* ignore close errors */ }
+			}
+			reportError(`could not record delivered event ${eventId}`, error);
 			return false;
 		}
 	};
 
-	const confirmDelivery = (eventId: string): void => {
-		if (!markDelivered(eventId)) return;
-		memoryEvents.delete(eventId);
-		deliveryAttempts.delete(eventId);
-		if (!pendingDir) return;
-		try { fs.unlinkSync(path.join(pendingDir, `${eventId}.json`)); } catch { /* ledger prevents replay */ }
+	const rememberQueuedPath = (eventId: string, queuedPath: string): void => {
+		const paths = queuedPaths.get(eventId) ?? new Set<string>();
+		paths.add(queuedPath);
+		queuedPaths.set(eventId, paths);
 	};
 
-	const eventIdFromEntry = (entry: unknown): string | null => {
+	const removeQueuedPaths = (eventId: string): void => {
+		const paths = queuedPaths.get(eventId);
+		if (!paths) return;
+		let allRemoved = true;
+		for (const queuedPath of paths) {
+			try {
+				fs.unlinkSync(queuedPath);
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code !== "ENOENT") allRemoved = false;
+			}
+		}
+		if (allRemoved) queuedPaths.delete(eventId);
+	};
+
+	const confirmDelivery = (eventId: string): void => {
+		if (!markDelivered(eventId)) return;
+		deliveryAttempts.delete(eventId);
+		removeQueuedPaths(eventId);
+	};
+
+	const eventIdFromSessionEntry = (entry: unknown): string | null => {
 		if (!entry || typeof entry !== "object") return null;
-		const record = entry as {
-			type?: unknown;
-			customType?: unknown;
-			details?: unknown;
-			message?: { customType?: unknown; details?: unknown };
-		};
-		const custom = record.type === "custom_message"
-			? record
-			: record.type === "message" && record.message?.customType === "subagent-report"
-				? record.message
-				: null;
-		if (!custom || custom.customType !== "subagent-report") return null;
-		const details = custom.details as { eventId?: unknown } | undefined;
+		const record = entry as { type?: unknown; customType?: unknown; details?: unknown };
+		if (record.type !== "custom_message" || record.customType !== "subagent-report") return null;
+		const details = record.details as { eventId?: unknown } | undefined;
+		return typeof details?.eventId === "string" ? details.eventId : null;
+	};
+
+	const eventIdFromRuntimeMessage = (message: unknown): string | null => {
+		if (!message || typeof message !== "object") return null;
+		const record = message as { role?: unknown; customType?: unknown; details?: unknown };
+		if (record.role !== "custom" || record.customType !== "subagent-report") return null;
+		const details = record.details as { eventId?: unknown } | undefined;
 		return typeof details?.eventId === "string" ? details.eventId : null;
 	};
 
 	const hasOutstandingEvents = (): boolean => {
-		if (memoryEvents.size > 0) return true;
 		if (!pendingDir) return false;
 		try {
 			return fs.readdirSync(pendingDir, { withFileTypes: true })
 				.some((file) => file.isFile() && file.name.endsWith(".json"));
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
-				reportSpoolError(`could not inspect pending events ${pendingDir}`, error);
+				reportError(`could not inspect pending events ${pendingDir}`, error);
 			}
 			return false;
 		}
 	};
 
-	// A non-throwing pi.sendMessage call is not an acknowledgement: Pi catches
-	// asynchronous send failures internally. Confirm only after the custom message
-	// is observable in the persisted JSONL session, then write an on-disk ledger
-	// before removing its spool file. Read only newly appended JSONL bytes while
-	// events are outstanding; inode changes and truncation reset the cursor. A crash
-	// after session append but before the ledger write can cause a duplicate on
-	// restart, which is intentionally safer than silent loss.
+	// Read only appended JSONL bytes while events are outstanding. Pi 0.84+
+	// persists extension messages as top-level custom_message entries. A crash
+	// after session append but before ledger fsync may replay once, which is safer
+	// than acknowledging a message that was never persisted.
 	const reconcilePersistedDeliveries = (): boolean => {
 		if (!sessionFile || !hasOutstandingEvents()) return false;
-		let fd: number | null = null;
+		let descriptor: number | null = null;
 		try {
-			fd = fs.openSync(sessionFile, "r");
-			const stat = fs.fstatSync(fd);
+			descriptor = fs.openSync(sessionFile, "r");
+			const stat = fs.fstatSync(descriptor);
 			const identity = `${stat.dev}:${stat.ino}`;
 			if (identity !== sessionFileIdentity || stat.size < sessionReadOffset) {
 				sessionFileIdentity = identity;
@@ -255,14 +247,14 @@ export default function (pi: ExtensionAPI) {
 			const length = stat.size - sessionReadOffset;
 			if (length > 0) {
 				const buffer = Buffer.allocUnsafe(length);
-				const bytesRead = fs.readSync(fd, buffer, 0, length, sessionReadOffset);
+				const bytesRead = fs.readSync(descriptor, buffer, 0, length, sessionReadOffset);
 				sessionReadOffset += bytesRead;
 				const lines = (sessionReadRemainder + buffer.toString("utf-8", 0, bytesRead)).split("\n");
 				sessionReadRemainder = lines.pop() ?? "";
 				for (const line of lines) {
 					if (!line.trim()) continue;
 					try {
-						const eventId = eventIdFromEntry(JSON.parse(line));
+						const eventId = eventIdFromSessionEntry(JSON.parse(line));
 						if (eventId) confirmDelivery(eventId);
 					} catch {
 						/* malformed session entries are Pi's responsibility */
@@ -271,11 +263,11 @@ export default function (pi: ExtensionAPI) {
 			}
 			return true;
 		} catch (error) {
-			reportSpoolError(`could not reconcile session ${sessionFile}`, error);
+			reportError(`could not reconcile session ${sessionFile}`, error);
 			return false;
 		} finally {
-			if (fd !== null) {
-				try { fs.closeSync(fd); } catch { /* ignore close errors */ }
+			if (descriptor !== null) {
+				try { fs.closeSync(descriptor); } catch { /* ignore close errors */ }
 			}
 		}
 	};
@@ -294,13 +286,12 @@ export default function (pi: ExtensionAPI) {
 		if (typeof scheduledDrain.unref === "function") scheduledDrain.unref();
 	};
 
-	const attemptDelivery = (input: CompletionEvent): void => {
+	const attemptDelivery = (event: CompletionEvent): void => {
 		if (!active) return;
-		const event = snapshotEvent(input);
-		const { id, status, reportPath, reportBody = "" } = event;
+		const { id, status, reportPath, reportBody } = event;
 		const eventId = completionEventId(event);
 		if (isDelivered(eventId)) {
-			confirmDelivery(eventId);
+			removeQueuedPaths(eventId);
 			return;
 		}
 		const lastAttempt = deliveryAttempts.get(eventId) ?? 0;
@@ -311,8 +302,7 @@ export default function (pi: ExtensionAPI) {
 		const label =
 			status === "done" ? "finished"
 			: status === "exited" ? "exited"
-			: status === "idle" ? "is idle — may have answered inline or need input"
-			: status;
+			: "is idle — may have answered inline or need input";
 		const content =
 			`📋 subagent #${id} ${label}.\n\n` +
 			`${preview || "(no report captured)"}\n\n` +
@@ -330,37 +320,9 @@ export default function (pi: ExtensionAPI) {
 				},
 				{ deliverAs: "steer", triggerTurn: wake },
 			);
-			// Check the session after Pi has had a chance to persist the message.
 			scheduleDrain(100);
 		} catch {
-			// Synchronous stale-runtime errors must never escape a background callback.
 			deliveryAttempts.delete(eventId);
-		}
-	};
-
-	const rememberEvent = (input: CompletionEvent): void => {
-		const event = snapshotEvent(input);
-		const eventId = completionEventId(event);
-		if (isDelivered(eventId)) {
-			confirmDelivery(eventId);
-			return;
-		}
-		// Keep an in-memory copy before attempting the spool. If ENOSPC or a
-		// permission error prevents persistence after the CLI marker advanced, the
-		// next drain retries this event instead of silently dropping it.
-		memoryEvents.set(eventId, event);
-		if (queueEvent(event)) memoryEvents.delete(eventId);
-		attemptDelivery(event);
-	};
-
-	const flushMemoryEvents = (): void => {
-		for (const [eventId, event] of memoryEvents) {
-			if (isDelivered(eventId)) {
-				confirmDelivery(eventId);
-				continue;
-			}
-			if (queueEvent(event)) memoryEvents.delete(eventId);
-			attemptDelivery(event);
 		}
 	};
 
@@ -370,8 +332,25 @@ export default function (pi: ExtensionAPI) {
 		try {
 			fs.renameSync(queuedPath, corruptPath);
 		} catch (error) {
-			reportSpoolError(`could not quarantine corrupt event ${queuedPath}`, error);
+			reportError(`could not quarantine corrupt event ${queuedPath}`, error);
 		}
+	};
+
+	const parseQueuedEvent = (contents: string): CompletionEvent | null => {
+		let parsed: Partial<CompletionEvent>;
+		try {
+			parsed = JSON.parse(contents) as Partial<CompletionEvent>;
+		} catch {
+			return null;
+		}
+		if (
+			typeof parsed.id !== "string" ||
+			(parsed.status !== "done" && parsed.status !== "idle" && parsed.status !== "exited") ||
+			typeof parsed.reportPath !== "string" ||
+			typeof parsed.reportBody !== "string" ||
+			typeof parsed.completionKey !== "string"
+		) return null;
+		return parsed as CompletionEvent;
 	};
 
 	const flushQueuedEvents = (): void => {
@@ -381,15 +360,11 @@ export default function (pi: ExtensionAPI) {
 			files = fs.readdirSync(pendingDir, { withFileTypes: true });
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
-				reportSpoolError(`could not list pending events ${pendingDir}`, error);
+				reportError(`could not list pending events ${pendingDir}`, error);
 			}
 			return;
 		}
 
-		// The spool is shared by Pi hosts in one tmux session. Running multiple lead
-		// Pi hosts in the same tmux session is unsupported and may duplicate a replay;
-		// duplicates are acceptable, while records are never removed merely because
-		// sendMessage returned. The delivered ledger deduplicates after persistence.
 		for (const file of files) {
 			if (!file.isFile() || !file.name.endsWith(".json")) continue;
 			const queuedPath = path.join(pendingDir, file.name);
@@ -397,36 +372,19 @@ export default function (pi: ExtensionAPI) {
 			try {
 				contents = fs.readFileSync(queuedPath, "utf-8");
 			} catch (error) {
-				// Transient IO failures are not corruption. Leave the original record in
-				// place so a later drain can retry it.
-				reportSpoolError(`could not read pending event ${queuedPath}`, error);
+				reportError(`could not read pending event ${queuedPath}`, error);
 				continue;
 			}
 
-			let parsed: Partial<CompletionEvent>;
-			try {
-				parsed = JSON.parse(contents) as Partial<CompletionEvent>;
-			} catch {
+			const event = parseQueuedEvent(contents);
+			if (!event) {
 				quarantineCorruptEvent(queuedPath);
 				continue;
 			}
-			if (
-				typeof parsed.id !== "string" ||
-				typeof parsed.status !== "string" ||
-				typeof parsed.reportPath !== "string" ||
-				(parsed.reportBody !== undefined && typeof parsed.reportBody !== "string")
-			) {
-				quarantineCorruptEvent(queuedPath);
-				continue;
-			}
-			const event = snapshotEvent(parsed as CompletionEvent);
 			const eventId = completionEventId(event);
+			rememberQueuedPath(eventId, queuedPath);
 			if (isDelivered(eventId)) {
-				confirmDelivery(eventId);
-				// Spools from older extension versions may be named with the old hash.
-				if (queuedPath !== path.join(pendingDir, `${eventId}.json`)) {
-					try { fs.unlinkSync(queuedPath); } catch { /* retry cleanup next drain */ }
-				}
+				removeQueuedPaths(eventId);
 				continue;
 			}
 			attemptDelivery(event);
@@ -444,7 +402,6 @@ export default function (pi: ExtensionAPI) {
 	const drain = (): void => {
 		if (!active) return;
 		reconcilePersistedDeliveries();
-		flushMemoryEvents();
 		flushQueuedEvents();
 		if (draining) {
 			pending = true;
@@ -456,17 +413,10 @@ export default function (pi: ExtensionAPI) {
 			finishDrain = resolve;
 		});
 		try {
-			execFile(bin, ["events"], { encoding: "utf-8", timeout: 10_000 }, (_err, stdout) => {
+			execFile(bin, ["events"], { encoding: "utf-8", timeout: 10_000 }, (error) => {
 				try {
-					if (stdout) {
-						for (const line of stdout.split("\n")) {
-							if (!line.trim()) continue;
-							const event = parseEventLine(line);
-							if (event) rememberEvent(event);
-						}
-					}
-				} catch (error) {
-					reportSpoolError("event drain callback failed", error);
+					if (error) reportError("event detection failed", error);
+					flushQueuedEvents();
 				} finally {
 					const shouldDrainAgain = pending;
 					pending = false;
@@ -475,7 +425,7 @@ export default function (pi: ExtensionAPI) {
 				}
 			});
 		} catch (error) {
-			reportSpoolError("could not start event drain", error);
+			reportError("could not start event detection", error);
 			completeDrain();
 		}
 	};
@@ -505,9 +455,9 @@ export default function (pi: ExtensionAPI) {
 
 	const start = (_event: unknown, ctx: ExtensionContext): void => {
 		if (active) return;
-		const sid = currentSessionId();
-		if (!sid) return;
-		sessionDir = path.join(stateDir, sid);
+		const session = currentTmuxSession();
+		if (!session) return;
+		sessionDir = path.join(stateDir, session);
 		pendingDir = path.join(sessionDir, ".watcher-pending");
 		deliveredDir = path.join(sessionDir, ".watcher-delivered");
 		sessionFile = ctx.sessionManager.getSessionFile();
@@ -515,72 +465,37 @@ export default function (pi: ExtensionAPI) {
 		sessionReadOffset = 0;
 		sessionReadRemainder = "";
 		active = true;
-		try { fs.mkdirSync(sessionDir, { recursive: true }); } catch { /* later drains will retry */ }
+		try { fs.mkdirSync(sessionDir, { recursive: true }); } catch { /* later drains retry */ }
 		pruneDeliveredLedger();
 
 		timer = setInterval(() => scheduleDrain(0), intervalMs);
 		if (typeof timer.unref === "function") timer.unref();
-
-		// fs.watch gives snappier delivery of `done` events (result-file writes);
-		// the interval is the safety net and drives the time-based idle detection.
-		try {
-			watcher = fs.watch(sessionDir, { recursive: true }, (_eventType, filename) => {
-				const changedPath = filename?.toString();
-				if (
-					!changedPath ||
-					path.basename(changedPath) === "result.md" ||
-					changedPath.includes(".watcher-pending")
-				) {
-					scheduleDrain(100);
-				}
-			});
-			watcher.on("error", () => {});
-		} catch {
-			/* fs.watch unavailable — interval still covers it */
-		}
 		scheduleDrain(0);
 	};
 
 	const stop = async (): Promise<void> => {
 		active = false;
 		pending = false;
-
 		if (timer) {
 			clearInterval(timer);
 			timer = null;
-		}
-		if (watcher) {
-			try { watcher.close(); } catch { /* ignore watcher close errors */ }
-			watcher = null;
 		}
 		if (scheduledDrain) {
 			clearTimeout(scheduledDrain);
 			scheduledDrain = null;
 			scheduledDrainAt = 0;
 		}
-
-		// Let an in-flight `subagents events` finish so it releases its directory
-		// lock and spools late stdout before Pi invalidates this extension runtime.
+		// Let an in-flight CLI process finish queueing before this runtime exits.
 		const inFlight = drainPromise;
 		if (inFlight) await inFlight;
-		for (const event of memoryEvents.values()) queueEvent(event);
-		// If spool storage stays unavailable until the process exits, no extension
-		// can make a volatile event survive that process death; queueEvent has
-		// already surfaced that residual failure on stderr rather than hiding it.
 		draining = false;
 	};
 
 	pi.on("session_start", start);
 	pi.on("message_end", (event) => {
-		const eventId = eventIdFromEntry({ type: "message", message: event.message });
-		if (!eventId) return;
-		if (!sessionFile) {
-			// Ephemeral sessions provide no durable acknowledgement. Keep the spool so
-			// the report is replayed at least once into a future persisted session.
-			return;
-		}
-		// The hook runs immediately before SessionManager persistence. Reconcile on
-		// the next timer tick rather than acknowledging prematurely.
+		const eventId = eventIdFromRuntimeMessage(event.message);
+		if (!eventId || !sessionFile) return;
+		// The hook runs immediately before SessionManager persistence.
 		scheduleDrain(0);
 	});
 	pi.on("session_shutdown", stop);

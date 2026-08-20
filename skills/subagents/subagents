@@ -69,27 +69,33 @@ sadir() { # id -> "$SR/<id>"
 # run in), then from $TMUX ("socket,pid,<session-num>" -> "$<num>"), then last
 # resort the active session. The $TMUX_PANE path is the reliable one; the others
 # cover contexts where it is unset.
-_CUR_SID=""
-cur_sid() {
-	[ -n "$_CUR_SID" ] && { printf '%s' "$_CUR_SID"; return 0; }
+_CURRENT_SESSION=""
+current_session_id() {
+	[ -n "$_CURRENT_SESSION" ] && { printf '%s' "$_CURRENT_SESSION"; return 0; }
 	if [ -n "${TMUX_PANE:-}" ]; then
-		_CUR_SID=$(tmux display-message -pt "$TMUX_PANE" '#{session_id}' 2>/dev/null)
+		_CURRENT_SESSION=$(tmux display-message -pt "$TMUX_PANE" '#{session_id}' 2>/dev/null)
 	fi
-	if [ -z "$_CUR_SID" ] && [ -n "${TMUX:-}" ]; then
+	if [ -z "$_CURRENT_SESSION" ] && [ -n "${TMUX:-}" ]; then
 		local num; num=$(printf '%s' "$TMUX" | awk -F, '{print $3}')
-		case "$num" in ''|*[!0-9]*) ;; *) _CUR_SID=\$"$num" ;; esac
+		case "$num" in ''|*[!0-9]*) ;; *) _CURRENT_SESSION=\$"$num" ;; esac
 	fi
-	[ -n "$_CUR_SID" ] || _CUR_SID=$(tmux display-message -p '#{session_id}' 2>/dev/null)
-	printf '%s' "$_CUR_SID"
+	[ -n "$_CURRENT_SESSION" ] || _CURRENT_SESSION=$(tmux display-message -p '#{session_id}' 2>/dev/null)
+	printf '%s' "$_CURRENT_SESSION"
+}
+
+valid_session_id() {
+	local number
+	case "$1" in \$*) number=${1#\$} ;; *) return 1 ;; esac
+	case "$number" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac
 }
 # Cached absolute path to the current session's state folder (created on demand).
 # Cached so the per-call mkdir only happens once; sr() is safe to call in loops.
 _SR=""
 sr() {
 	[ -n "$_SR" ] && { printf '%s' "$_SR"; return 0; }
-	local sid; sid=$(cur_sid)
-	[ -n "$sid" ] || die "cannot determine current tmux session"
-	_SR="$STATE_DIR/$sid"; mkdir -p "$_SR"
+	local session_id; session_id=$(current_session_id)
+	[ -n "$session_id" ] || die "cannot determine current tmux session"
+	_SR="$STATE_DIR/$session_id"; mkdir -p "$_SR"
 	printf '%s' "$_SR"
 }
 
@@ -116,92 +122,162 @@ send_pane() { # pane_id message...
 	tmux send-keys -t "$pane" Enter
 }
 
-file_mtime() { # path -> mtime epoch; works with GNU coreutils or BSD stat
-	local m
-	m=$(stat -c %Y "$1" 2>/dev/null) || m=$(stat -f %m "$1" 2>/dev/null) || m=0
-	case "$m" in '' | *[!0-9]*) m=0 ;; esac
-	printf '%s\n' "$m"
+# All CLI critical sections use the same atomic hard-link lock. The lock file
+# contains the owner's pid, process identity, token, and acquisition time before
+# it becomes visible. A lock is reclaimed only when that exact process is gone;
+# age alone never breaks a live lock. The recovery hard link serializes
+# competing reclaimers so they cannot both remove and replace the same lock.
+LOCK_PATH=""
+LOCK_TOKEN=""
+LOCK_CANDIDATE=""
+
+process_identity() { # pid -> stable identity for the lifetime of that process
+	local identity
+	identity=$(ps -o lstart= -p "$1" 2>/dev/null | cksum 2>/dev/null | awk '{print $1 ":" $2}')
+	[ -n "$identity" ] && printf '%s\n' "$identity" || printf '%s\n' unknown
 }
 
-seq_lock_is_stale() { # lock-dir -> true when old enough and owner is dead/missing
-	local lock="$1" pid started mtime now
-	[ -d "$lock" ] || return 1
-	mtime=$(file_mtime "$lock"); now=$(date +%s)
-	[ $((now - mtime)) -ge 3 ] || return 1
-	read -r pid started <"$lock/owner" 2>/dev/null || return 0
-	case "$pid" in ''|*[!0-9]*) return 0 ;; esac
-	! kill -0 "$pid" 2>/dev/null
+lock_record_valid() { # lock-file
+	local owner_pid owner_identity owner_token owner_time
+	[ -f "$1" ] || return 1
+	read -r owner_pid owner_identity owner_token owner_time <"$1" 2>/dev/null || return 1
+	case "$owner_pid" in ''|*[!0-9]*) return 1 ;; esac
+	case "$owner_time" in ''|*[!0-9]*) return 1 ;; esac
+	[ -n "$owner_identity" ] && [ -n "$owner_token" ]
+}
+
+lock_owner_abandoned() { # lock-file -> true only when its recorded owner is gone
+	local lock="$1" owner_pid owner_identity owner_token owner_time current_identity
+	lock_record_valid "$lock" || return 1
+	read -r owner_pid owner_identity owner_token owner_time <"$lock"
+	if ! kill -0 "$owner_pid" 2>/dev/null; then return 0; fi
+	if [ "$owner_identity" != unknown ]; then
+		current_identity=$(process_identity "$owner_pid")
+		[ "$current_identity" != unknown ] && [ "$current_identity" != "$owner_identity" ] && return 0
+	fi
+	return 1
+}
+
+lock_owner_description() { # lock-file
+	local owner_pid owner_identity owner_token owner_time
+	read -r owner_pid owner_identity owner_token owner_time <"$1" 2>/dev/null || {
+		printf '%s' "unreadable owner"; return
+	}
+	printf 'pid %s, acquired %s' "$owner_pid" "$owner_time"
+}
+
+recover_abandoned_lock() { # lock-file label
+	local lock="$1" label="$2" recovery="${1}.recover" owner
+	lock_owner_abandoned "$lock" || return 1
+
+	# A recovery link that names a different inode is residue from a completed
+	# takeover and can be removed without touching the current owner.
+	if [ -e "$recovery" ] && ! { [ -f "$lock" ] && [ "$lock" -ef "$recovery" ]; }; then
+		return 1
+	fi
+	[ ! -e "$recovery" ] || return 1
+	ln "$lock" "$recovery" 2>/dev/null || return 1
+	if [ ! "$lock" -ef "$recovery" ] || ! lock_owner_abandoned "$recovery"; then
+		rm -f "$recovery" 2>/dev/null || true
+		return 1
+	fi
+
+	owner=$(lock_owner_description "$recovery")
+	rm -f "$lock" || { rm -f "$recovery" 2>/dev/null || true; return 1; }
+	rm -f "$recovery" 2>/dev/null || true
+	echo "subagents: recovered abandoned $label lock ($owner)" >&2
+	return 0
+}
+
+lock_cleanup() {
+	[ -z "$LOCK_CANDIDATE" ] || rm -f "$LOCK_CANDIDATE" 2>/dev/null || true
+	LOCK_CANDIDATE=""
+	lock_release
+}
+
+lock_release() {
+	local owner_pid owner_identity owner_token owner_time
+	[ -n "$LOCK_PATH" ] || return 0
+	if read -r owner_pid owner_identity owner_token owner_time <"$LOCK_PATH" 2>/dev/null \
+		&& [ "$owner_token" = "$LOCK_TOKEN" ]; then
+		rm -f "$LOCK_PATH" 2>/dev/null || true
+	fi
+	LOCK_PATH=""; LOCK_TOKEN=""
+}
+
+lock_acquire() { # lock-file label
+	local lock="$1" label="$2" attempts=0 owner_pid owner_identity
+	[ -z "$LOCK_PATH" ] || die "internal error: nested CLI lock"
+	[ ! -d "$lock" ] || die "unsupported lock directory at $lock; remove it after confirming no CLI is running"
+
+	owner_pid=${BASHPID:-$$}
+	owner_identity=$(process_identity "$owner_pid")
+	LOCK_TOKEN="$owner_pid.$(date +%s).$RANDOM"
+	LOCK_CANDIDATE="${lock}.candidate.$LOCK_TOKEN"
+	printf '%s %s %s %s\n' "$owner_pid" "$owner_identity" "$LOCK_TOKEN" "$(date +%s)" >"$LOCK_CANDIDATE" \
+		|| die "could not create $label lock candidate"
+	trap 'lock_cleanup' EXIT
+	trap 'lock_cleanup; exit 1' HUP INT TERM
+
+	while :; do
+		if ln "$LOCK_CANDIDATE" "$lock" 2>/dev/null; then
+			LOCK_PATH="$lock"
+			rm -f "$LOCK_CANDIDATE" 2>/dev/null || true
+			LOCK_CANDIDATE=""
+			return 0
+		fi
+		[ ! -d "$lock" ] || die "unsupported lock directory at $lock; remove it after confirming no CLI is running"
+		if [ -e "$lock" ] && ! lock_record_valid "$lock"; then
+			[ ! -e "$lock" ] || die "invalid $label lock record at $lock; refusing unsafe recovery"
+		fi
+		recover_abandoned_lock "$lock" "$label" && continue
+		attempts=$((attempts + 1))
+		if [ "$attempts" -ge 200 ]; then
+			if lock_owner_abandoned "$lock"; then
+				die "timed out recovering abandoned $label lock at $lock"
+			fi
+			die "timed out waiting for $label lock at $lock"
+		fi
+		sleep 0.05
+	done
 }
 
 # Reserve a monotonically increasing id. The persistent counter survives
 # `stop`/`stop --all`, so a later subagent never reuses an earlier subagent's id.
-# The lock serializes concurrent launchers; gaps after crashes are harmless.
+# Gaps after crashes are harmless.
 reserve_id() {
-	local root lock attempts=0 seq max dir name candidate tmp q_lock stale owner_pid
+	local root lock seq candidate tmp
 	root=$(sr); lock="$root/.seq.lock"
-	until mkdir "$lock" 2>/dev/null; do
-		if seq_lock_is_stale "$lock"; then
-			stale="$root/.seq.lock.stale.${BASHPID:-$$}.$RANDOM"
-			if mv "$lock" "$stale" 2>/dev/null; then rm -rf "$stale"; fi
-			continue
-		fi
-		attempts=$((attempts + 1))
-		[ "$attempts" -lt 200 ] || die "timed out waiting for subagent id lock"
-		sleep 0.05
-	done
-	q_lock=$(printf %q "$lock")
-	trap "rm -rf $q_lock 2>/dev/null || true" EXIT HUP INT TERM
-	owner_pid=${BASHPID:-$$}
-	printf '%s %s\n' "$owner_pid" "$(date +%s)" >"$lock/owner" || die "could not record subagent id lock owner"
+	lock_acquire "$lock" "sequence"
 
 	seq=$(cat "$root/.seq" 2>/dev/null || echo 0)
-	case "$seq" in ''|*[!0-9]*) seq=0 ;; esac
-	# Migration: never allocate below ids created before the counter existed.
-	max=$seq
-	for dir in "$root"/[0-9]*/; do
-		[ -d "$dir" ] || continue
-		name=$(basename "$dir")
-		case "$name" in *[!0-9]*|'') continue ;; esac
-		[ "$name" -gt "$max" ] && max="$name"
-	done
+	case "$seq" in ''|*[!0-9]*) die "invalid subagent id counter at $root/.seq" ;; esac
+	candidate=$((seq + 1))
+	[ ! -e "$root/$candidate" ] || die "subagent id counter conflicts with existing agent #$candidate"
+	tmp="$root/.seq.tmp.$$.$RANDOM"
+	printf '%s\n' "$candidate" >"$tmp" || die "could not persist subagent id counter"
+	mv "$tmp" "$root/.seq" || die "could not persist subagent id counter"
+	mkdir "$root/$candidate" || die "could not create state for subagent #$candidate"
 
-	while :; do
-		candidate=$((max + 1)); tmp="$root/.seq.tmp.$$.$RANDOM"
-		printf '%s\n' "$candidate" >"$tmp" || die "could not persist subagent id counter"
-		mv "$tmp" "$root/.seq" || die "could not persist subagent id counter"
-		if mkdir "$root/$candidate" 2>/dev/null; then break; fi
-		max=$candidate
-	done
-
-	trap - EXIT HUP INT TERM
-	rm -rf "$lock" 2>/dev/null || true
+	lock_release
 	printf '%s\n' "$candidate"
 }
 
-# Serialise the lookup/create/split sequence. In particular, a caller that saw
-# no window before waiting on the lock must re-check under the lock and reuse a
-# window created by the winner instead of creating a duplicate.
+# Serialize the lookup/create/split sequence. A caller that waited for another
+# launcher re-checks under the lock and reuses the winner's window.
 create_subagent_pane() { # session command
-	local sess="$1" picmd="$2" lock q_lock win pane attempts=0
-	lock="$(sr)/.window-lock"
-	until mkdir "$lock" 2>/dev/null; do
-		attempts=$((attempts + 1))
-		[ "$attempts" -lt 200 ] || die "timed out waiting for subagents window lock"
-		sleep 0.05
-	done
-	q_lock=$(printf %q "$lock")
-	trap "rmdir $q_lock 2>/dev/null || true" EXIT
-	trap 'exit 1' HUP INT TERM
+	local session="$1" picmd="$2" lock win pane
+	lock="$(sr)/.window.lock"
+	lock_acquire "$lock" "tmux window"
 
-	win=$(subagents_window "$sess")
+	win=$(subagents_window "$session")
 	if [ -z "$win" ]; then
-		pane=$(tmux new-window -d -t "$sess" -n "$WIN_PREFIX" -P -F '#{pane_id}' "$picmd") || return 1
+		pane=$(tmux new-window -d -t "$session" -n "$WIN_PREFIX" -P -F '#{pane_id}' "$picmd") || return 1
 	else
 		pane=$(tmux split-window -d -t "$win" -P -F '#{pane_id}' "$picmd") || return 1
 		tmux select-layout -t "$win" tiled >/dev/null 2>&1 || true
 	fi
-	rmdir "$lock" 2>/dev/null || true
-	trap - EXIT HUP INT TERM
+	lock_release
 	printf '%s\n' "$pane"
 }
 
@@ -231,64 +307,161 @@ EOF
 
 # ---- completion detection (shared by wait / events / reap) ----------------
 
-# Snapshot a report to reports/<n>.md and echo its path. Copies $2 (a file) when
-# non-empty, otherwise captures the pane tail. Makes each event immutable.
+# Snapshot a report to a new reports/<n>.md without advancing any completion
+# marker. The event consumer lock serializes number selection. Existing files
+# are never overwritten, including snapshots left by a crash before queueing.
+SNAPSHOT_PATH=""
+SNAPSHOT_NUMBER=""
 snapshot() { # id source-file-or-empty
-	local id="$1" src="$2" dir; dir=$(sadir "$id")
-	n=$(cat "$dir/revent" 2>/dev/null || echo 0); n=$((n + 1)); echo "$n" >"$dir/revent"
-	mkdir -p "$dir/reports"; out="$dir/reports/$n.md"
+	local id="$1" src="$2" dir n out tmp
+	dir=$(sadir "$id")
+	n=$(cat "$dir/revent" 2>/dev/null || echo 0)
+	case "$n" in ''|*[!0-9]*) n=0 ;; esac
+	mkdir -p "$dir/reports" || return 1
+	while :; do
+		n=$((n + 1)); out="$dir/reports/$n.md"
+		[ -e "$out" ] || break
+	done
+	tmp="$dir/reports/.$n.tmp.$$.$RANDOM"
 	if [ -n "$src" ] && [ -s "$src" ]; then
-		cp "$src" "$out"
+		cp "$src" "$tmp" || return 1
 	else
-		tmux capture-pane -p -t "$(cat "$dir/pane")" 2>/dev/null | grep -v '^[[:space:]]*$' | tail -40 >"$out"
+		{ tmux capture-pane -p -t "$(cat "$dir/pane")" 2>/dev/null \
+			| grep -v '^[[:space:]]*$' || true; } | tail -40 >"$tmp" || return 1
 	fi
-	echo "$out"
+	mv "$tmp" "$out" || return 1
+	SNAPSHOT_PATH="$out"; SNAPSHOT_NUMBER="$n"
+}
+
+commit_snapshot_sequence() { # agent-dir
+	printf '%s\n' "$SNAPSHOT_NUMBER" >"$1/revent"
+}
+
+sync_snapshot_sequence() { # agent-dir; recover a snapshot queued before a crash
+	local dir="$1" report name max=0
+	for report in "$dir"/reports/[0-9]*.md; do
+		[ -f "$report" ] || continue
+		name=$(basename "$report" .md)
+		case "$name" in ''|*[!0-9]*) continue ;; esac
+		[ "$name" -gt "$max" ] && max="$name"
+	done
+	[ "$max" -eq 0 ] || printf '%s\n' "$max" >"$dir/revent"
+}
+
+# Write the complete watcher record before a push consumer marker changes.
+# The temp file and containing directory are fsynced around the atomic rename.
+# A deterministic completion key makes replay deduplication independent of the
+# snapshot path, including a crash after queueing but before marker persistence.
+spool_completion() { # id status report-path completion-key spool-name
+	local id="$1" status="$2" report_path="$3" completion_key="$4" spool_name="$5"
+	local pending target
+	pending="$(sr)/.watcher-pending"; target="$pending/$spool_name.json"
+	mkdir -p "$pending" || return 1
+	[ ! -f "$target" ] || return 0
+	node - "$target" "$id" "$status" "$report_path" "$completion_key" <<'NODE'
+const fs = require("node:fs");
+const path = require("node:path");
+const { randomUUID } = require("node:crypto");
+const [target, id, status, reportPath, completionKey] = process.argv.slice(2);
+const directory = path.dirname(target);
+const reportBody = fs.readFileSync(reportPath, "utf8").trim();
+const record = JSON.stringify({ id, status, reportPath, reportBody, completionKey });
+const temporary = path.join(directory, `.${path.basename(target)}.${randomUUID()}.tmp`);
+let descriptor;
+try {
+	descriptor = fs.openSync(temporary, "wx", 0o600);
+	fs.writeFileSync(descriptor, record, "utf8");
+	fs.fsyncSync(descriptor);
+	fs.closeSync(descriptor);
+	descriptor = undefined;
+	if (fs.existsSync(target)) {
+		fs.unlinkSync(temporary);
+	} else {
+		fs.renameSync(temporary, target);
+	}
+	const directoryDescriptor = fs.openSync(directory, "r");
+	try { fs.fsyncSync(directoryDescriptor); } finally { fs.closeSync(directoryDescriptor); }
+} catch (error) {
+	if (descriptor !== undefined) fs.closeSync(descriptor);
+	try { fs.unlinkSync(temporary); } catch {}
+	throw error;
+}
+NODE
+}
+
+# Prepare and optionally durably queue one immutable completion. Returns:
+#   0 = event printed, 2 = persistence failure, 3 = already queued by a prior
+#   crashed invocation (no duplicate stdout; the watcher will replay the spool).
+emit_completion() { # id status source completion-key spool-name durable
+	local id="$1" status="$2" source="$3" completion_key="$4" spool_name="$5" durable="$6"
+	local queued="$(sr)/.watcher-pending/$spool_name.json"
+	if [ "$durable" = 1 ] && [ -f "$queued" ]; then return 3; fi
+	if ! snapshot "$id" "$source"; then
+		echo "subagents: could not snapshot completion for subagent #$id" >&2
+		return 2
+	fi
+	if [ "$durable" = 1 ] && ! spool_completion "$id" "$status" "$SNAPSHOT_PATH" "$completion_key" "$spool_name"; then
+		echo "subagents: could not durably queue completion for subagent #$id" >&2
+		return 2
+	fi
+	commit_snapshot_sequence "$(sadir "$id")"
+	printf '%s\t%s\t%s\n' "$id" "$status" "$SNAPSHOT_PATH"
+	return 0
 }
 
 # Detect a NEW completion for one subagent and print a TSV line:
 #   "<id>\t<status>\t<reportPath>"   (status = done | idle | exited)
-# Returns 0 when an event was emitted, else 1. Idempotent: a given report is
-# emitted once (keyed on the result file's content hash). A per-subagent lock
-# serialises concurrent pollers (watcher extension + a manual `wait`) so the
-# same completion can't be double-emitted.
-detect_and_emit() { # id
-	local id="$1" dir; dir=$(sadir "$id")
+# Push detection durably queues the immutable report before advancing the hash
+# or exit marker. One consistent lock serializes watcher and pull consumers.
+detect_and_emit() { # id durable(0|1)
+	local id="$1" durable="${2:-0}" dir rc
+	dir=$(sadir "$id")
 	[ -d "$dir" ] && [ -f "$dir/pane" ] || return 1
-	mkdir "$dir/.lock" 2>/dev/null || return 1   # another poller is mid-detect
-	local rc=1
-	_emit_for "$id" && rc=0
-	rmdir "$dir/.lock" 2>/dev/null
+	lock_acquire "$dir/.event.lock" "event consumer for subagent #$id"
+	_emit_for "$id" "$durable"; rc=$?
+	lock_release
 	return "$rc"
 }
 
-_emit_for() { # id  (runs holding $dir/.lock)
-	local id="$1" dir; dir=$(sadir "$id")
-	local pane; pane=$(cat "$dir/pane")
+_emit_for() { # id durable (runs holding the event consumer lock)
+	local id="$1" durable="$2" dir pane emit_rc
+	dir=$(sadir "$id"); pane=$(cat "$dir/pane")
 
 	if ! pane_alive "$pane"; then
 		[ -f "$dir/.exited" ] && return 1
-		: >"$dir/.exited"
-		printf '%s\t%s\t%s\n' "$id" "exited" "$(snapshot "$id" "$dir/result.md")"
-		return 0
+		emit_completion "$id" "exited" "$dir/result.md" "$id:exited" "$id-exited" "$durable"
+		emit_rc=$?
+		case "$emit_rc" in
+			0|3) : >"$dir/.exited"; [ "$emit_rc" = 3 ] && sync_snapshot_sequence "$dir"; return "$emit_rc" ;;
+			*) return 2 ;;
+		esac
 	fi
 
-	# done: result file holds content we haven't reported yet (keyed on content
-	# hash, so re-renders / repeated polls never re-emit the same report)
+	# A result-file completion is keyed on its content checksum. The watcher event
+	# uses the same stable key, while the report path points at an immutable copy.
 	if [ -s "$dir/result.md" ]; then
-		local rhash curhash
+		local rhash curhash checksum bytes
 		rhash=$(cat "$dir/rhash" 2>/dev/null || echo "")
 		curhash=$(cksum <"$dir/result.md" 2>/dev/null)
 		if [ "$curhash" != "$rhash" ]; then
-			printf '%s' "$curhash" >"$dir/rhash"
-			echo 0 >"$dir/stable"; echo 0 >"$dir/saw"
-			tmux capture-pane -p -t "$pane" 2>/dev/null | cksum >"$dir/rphash"
-			printf '%s\t%s\t%s\n' "$id" "done" "$(snapshot "$id" "$dir/result.md")"
-			return 0
+			read -r checksum bytes <<<"$curhash"
+			emit_completion "$id" "done" "$dir/result.md" "$id:done:$checksum:$bytes" \
+				"$id-done-$checksum-$bytes" "$durable"
+			emit_rc=$?
+			case "$emit_rc" in
+				0|3)
+					printf '%s' "$curhash" >"$dir/rhash"
+					echo 0 >"$dir/stable"; echo 0 >"$dir/saw"
+					tmux capture-pane -p -t "$pane" 2>/dev/null | cksum >"$dir/rphash"
+					[ "$emit_rc" = 3 ] && sync_snapshot_sequence "$dir"
+					return "$emit_rc"
+					;;
+				*) return 2 ;;
+			esac
 		fi
 	fi
 
-	# idle fallback (stateful across calls): answered inline / waiting. Only fires
-	# after we've seen activity and the pane differs from the last reported state.
+	# Idle fallback: only a substantive inline answer that has gone quiet emits.
 	local lhash stable saw rphash cur
 	lhash=$(cat "$dir/lhash" 2>/dev/null || echo "")
 	stable=$(cat "$dir/stable" 2>/dev/null || echo 0)
@@ -297,19 +470,25 @@ _emit_for() { # id  (runs holding $dir/.lock)
 	cur=$(tmux capture-pane -p -t "$pane" 2>/dev/null | cksum)
 	if [ "$cur" != "$lhash" ]; then stable=0; saw=1; else stable=$((stable + 1)); fi
 	echo "$cur" >"$dir/lhash"; echo "$stable" >"$dir/stable"; echo "$saw" >"$dir/saw"
-	# Only an INLINE answer counts as an idle event: no result file was written,
-	# the pane has gone quiet, and it shows substantive (non-banner) content.
 	if [ "$stable" -ge "$IDLE_POLLS" ] && [ "$saw" = 1 ] && [ "$cur" != "$rphash" ] && [ ! -s "$dir/result.md" ]; then
-		local cap meaningful
+		local cap meaningful pane_checksum pane_bytes idle_source
 		cap=$(tmux capture-pane -p -t "$pane" 2>/dev/null | grep -v '^[[:space:]]*$')
 		meaningful=$(printf '%s\n' "$cap" | grep -vcE '^[[:space:]]*[][(){}<>=_~|*-]*[─│]*[[:space:]]*$|pi v[0-9]|Package Updates|Press ctrl|escape interrupt|Model scope|Pi can explain|Update Available|Changelog|Run pi update|^\[(Context|Themes|Skills|Prompts)\]')
 		if [ "${meaningful:-0}" -ge 3 ]; then
-			echo "$cur" >"$dir/rphash"; echo 0 >"$dir/saw"
-			local n out; n=$(cat "$dir/revent" 2>/dev/null || echo 0); n=$((n + 1)); echo "$n" >"$dir/revent"
-			mkdir -p "$dir/reports"; out="$dir/reports/$n.md"
-			printf '%s\n' "$cap" | tail -40 >"$out"
-			printf '%s\t%s\t%s\n' "$id" "idle" "$out"
-			return 0
+			read -r pane_checksum pane_bytes <<<"$cur"
+			idle_source="$dir/.idle-report.tmp.$$.$RANDOM"
+			printf '%s\n' "$cap" | tail -40 >"$idle_source"
+			emit_completion "$id" "idle" "$idle_source" "$id:idle:$pane_checksum:$pane_bytes" \
+				"$id-idle-$pane_checksum-$pane_bytes" "$durable"
+			emit_rc=$?; rm -f "$idle_source"
+			case "$emit_rc" in
+				0|3)
+					echo "$cur" >"$dir/rphash"; echo 0 >"$dir/saw"
+					[ "$emit_rc" = 3 ] && sync_snapshot_sequence "$dir"
+					return "$emit_rc"
+					;;
+				*) return 2 ;;
+			esac
 		fi
 	fi
 	return 1
@@ -330,10 +509,10 @@ cmd_config() {
 }
 
 cmd_doctor() {
-	local failures=0 warnings=0 orphan_sessions=0 legacy_dirs=0 sid root count dir name pane pane_sid launcher_bin
+	local failures=0 warnings=0 orphan_sessions=0 root count dir name pane pane_session launcher_bin session_id
 	local -a launcher_parts=()
 	in_tmux || { echo "FAIL tmux: not in a tmux session"; return 1; }
-	sid=$(cur_sid); root=$(sr)
+	session_id=$(current_session_id); root=$(sr)
 
 	read -r -a launcher_parts <<<"$PI_CMD"
 	launcher_bin="${launcher_parts[0]:-}"
@@ -344,49 +523,51 @@ cmd_doctor() {
 		failures=$((failures + 1))
 	fi
 
-	count=$(subagents_windows "$sid" | awk 'NF{n++} END{print n+0}')
+	count=$(subagents_windows "$session_id" | awk 'NF{n++} END{print n+0}')
 	if [ "$count" -le 1 ]; then
-		echo "ok   window: ${count} subagents window(s) in $sid"
+		echo "ok   window: ${count} subagents window(s) in $session_id"
 	else
-		echo "FAIL window: $count subagents windows in $sid (expected at most 1)"
+		echo "FAIL window: $count subagents windows in $session_id (expected at most 1)"
 		failures=$((failures + 1))
 	fi
 
 	# The watcher resolves exactly $STATE_DIR/<literal tmux session_id>/<numeric id>.
-	case "$sid" in \$[0-9]*) ;; *)
-		echo "FAIL state: unexpected tmux session id '$sid'"
-		failures=$((failures + 1)) ;;
-	esac
+	if ! valid_session_id "$session_id"; then
+		echo "FAIL state: unexpected tmux session id '$session_id'"
+		failures=$((failures + 1))
+	fi
 	for dir in "$STATE_DIR"/*/; do
 		[ -d "$dir" ] || continue
 		name=$(basename "$dir")
-		case "$name" in
-			\$[0-9]*)
-				if ! tmux list-sessions -F '#{session_id}' 2>/dev/null | grep -Fqx "$name"; then
-					orphan_sessions=$((orphan_sessions + 1))
-				fi
-				;;
-			[0-9]*) legacy_dirs=$((legacy_dirs + 1)) ;;
-			*)
-				echo "FAIL state: unexpected root entry $dir"
-				failures=$((failures + 1))
-				;;
-		esac
+		if ! valid_session_id "$name"; then
+			echo "FAIL state: unexpected root entry $dir"
+			failures=$((failures + 1)); continue
+		fi
+		if ! tmux list-sessions -F '#{session_id}' 2>/dev/null | grep -Fqx "$name"; then
+			orphan_sessions=$((orphan_sessions + 1))
+		fi
 	done
-	if [ "$legacy_dirs" -gt 0 ]; then
-		echo "WARN state: $legacy_dirs stale legacy numeric dir(s) under $STATE_DIR"
-		warnings=$((warnings + 1))
-	fi
 	if [ "$orphan_sessions" -gt 0 ]; then
 		echo "WARN state: $orphan_sessions orphaned tmux session dir(s) under $STATE_DIR"
 		warnings=$((warnings + 1))
 	fi
-	if seq_lock_is_stale "$root/.seq.lock"; then
-		local lock_pid lock_started
-		read -r lock_pid lock_started <"$root/.seq.lock/owner" 2>/dev/null || { lock_pid="?"; lock_started="?"; }
-		echo "WARN state: stale subagent id lock (owner pid $lock_pid, started $lock_started)"
-		warnings=$((warnings + 1))
-	fi
+	local lock_path lock_label
+	for lock_path in "$root/.seq.lock" "$root/.window.lock"; do
+		case "$lock_path" in *.seq.lock) lock_label="sequence" ;; *) lock_label="tmux window" ;; esac
+		if [ -e "$lock_path" ]; then
+			if lock_owner_abandoned "$lock_path"; then
+				echo "WARN state: abandoned $lock_label lock ($(lock_owner_description "$lock_path"))"
+				warnings=$((warnings + 1))
+			elif ! lock_record_valid "$lock_path"; then
+				echo "FAIL state: unsupported or invalid $lock_label lock at $lock_path"
+				failures=$((failures + 1))
+			fi
+		fi
+		if [ -e "$lock_path.recover" ]; then
+			echo "WARN state: incomplete $lock_label lock recovery at $lock_path.recover"
+			warnings=$((warnings + 1))
+		fi
+	done
 	for dir in "$root"/*/; do
 		[ -d "$dir" ] || continue
 		name=$(basename "$dir")
@@ -394,17 +575,31 @@ cmd_doctor() {
 			echo "FAIL state: non-numeric agent dir $dir"
 			failures=$((failures + 1)); continue ;;
 		esac
-		if [ ! -s "$dir/pane" ] || [ ! -s "$dir/sid" ] || [ ! -s "$dir/protocol.md" ] || [ ! -s "$dir/task" ] || [ ! -f "$dir/result.md" ]; then
+		if [ ! -s "$dir/pane" ] || [ ! -s "$dir/protocol.md" ] || [ ! -s "$dir/task" ] || [ ! -f "$dir/result.md" ]; then
 			echo "FAIL state: incomplete agent dir $dir"
 			failures=$((failures + 1)); continue
 		fi
+		lock_path="$dir/.event.lock"
+		if [ -e "$lock_path" ]; then
+			if lock_owner_abandoned "$lock_path"; then
+				echo "WARN state: abandoned event consumer lock for agent #$name ($(lock_owner_description "$lock_path"))"
+				warnings=$((warnings + 1))
+			elif ! lock_record_valid "$lock_path"; then
+				echo "FAIL state: unsupported or invalid event consumer lock at $lock_path"
+				failures=$((failures + 1))
+			fi
+		fi
+		if [ -e "$lock_path.recover" ]; then
+			echo "WARN state: incomplete event consumer lock recovery for agent #$name"
+			warnings=$((warnings + 1))
+		fi
 		pane=$(cat "$dir/pane")
-		pane_sid=$(tmux display-message -pt "$pane" '#{session_id}' 2>/dev/null || true)
-		if [ -z "$pane_sid" ]; then
+		pane_session=$(tmux display-message -pt "$pane" '#{session_id}' 2>/dev/null || true)
+		if [ -z "$pane_session" ]; then
 			echo "WARN state: orphaned agent #$name (pane $pane is gone)"
 			warnings=$((warnings + 1))
-		elif [ "$pane_sid" != "$sid" ]; then
-			echo "FAIL state: agent #$name pane belongs to $pane_sid, not $sid"
+		elif [ "$pane_session" != "$session_id" ]; then
+			echo "FAIL state: agent #$name pane belongs to $pane_session, not $session_id"
 			failures=$((failures + 1))
 		fi
 	done
@@ -443,7 +638,7 @@ cmd_run() {
 		die "model '$model_override' is not provider-qualified (expected provider/model)"
 	fi
 
-	local sess; sess=$(cur_sid)
+	local session_id; session_id=$(current_session_id)
 	local id; id=$(reserve_id) || die "failed to reserve subagent id"
 	case "$id" in ''|*[!0-9]*) die "failed to reserve subagent id" ;; esac
 	local dir; dir=$(sadir "$id")
@@ -469,13 +664,12 @@ cmd_run() {
 	picmd="$picmd --append-system-prompt $q_proto $q_task"
 
 	local pane
-	if ! pane=$(create_subagent_pane "$sess" "$picmd") || [ -z "$pane" ]; then
+	if ! pane=$(create_subagent_pane "$session_id" "$picmd") || [ -z "$pane" ]; then
 		rm -rf "$dir"
 		die "failed to create subagent pane"
 	fi
 
 	echo "$pane" >"$dir/pane"
-	printf '%s\n' "$(cur_sid)" >"$dir/sid"
 	printf '%s\n' "$task" >"$dir/task"
 	tmux select-pane -t "$pane" -T "subagent#$id" 2>/dev/null || true
 
@@ -518,12 +712,25 @@ cmd_wait() {
 # non-blocking). Iterating the per-session folder is the scoping mechanism —
 # other sessions' subagents live in sibling folders and are never visited.
 cmd_events() {
-	local dir id
+	local dir id rc failures=0
 	for dir in "$(sr)"/*/; do
 		[ -d "$dir" ] || continue
 		id=$(basename "$dir"); [ -f "$dir/pane" ] || continue
-		detect_and_emit "$id" || true
+		detect_and_emit "$id" 1; rc=$?
+		[ "$rc" = 2 ] && failures=$((failures + 1))
 	done
+	[ "$failures" = 0 ] || return 1
+}
+
+pull_events() {
+	local dir id rc failures=0
+	for dir in "$(sr)"/*/; do
+		[ -d "$dir" ] || continue
+		id=$(basename "$dir"); [ -f "$dir/pane" ] || continue
+		detect_and_emit "$id" 0; rc=$?
+		[ "$rc" = 2 ] && failures=$((failures + 1))
+	done
+	[ "$failures" = 0 ] || return 1
 }
 
 # Human-friendly drain of newly-finished reports.
@@ -535,7 +742,7 @@ cmd_reap() {
 		echo "=== subagent #$id — $status ==="
 		[ -s "$path" ] && cat "$path" || echo "(no report captured)"
 		echo
-	done < <(cmd_events)
+	done < <(pull_events)
 	[ "$any" = 1 ] || echo "no new reports"
 }
 
@@ -620,8 +827,8 @@ case "$cmd" in
 	reap)      cmd_reap  "$@" ;;
 	status)    cmd_status "$@" ;;
 	peek)      cmd_peek  "$@" ;;
-	ls|list)   cmd_ls    "$@" ;;
-	stop|kill) cmd_stop  "$@" ;;
+	ls)        cmd_ls    "$@" ;;
+	stop)      cmd_stop  "$@" ;;
 	""|-h|--help|help) usage ;;
 	*) die "unknown command '$cmd' (try: subagents --help)" ;;
 esac

@@ -30,6 +30,17 @@ grep -Fqx "window_name=helpers" <<<"$CONFIG"
 HELP=$(HOME="$TMP/home" SUBAGENTS_STATE_DIR="$TMP/state" "$CLI" --help)
 grep -Fq 'subagents config' <<<"$HELP"
 grep -Fq 'subagents run [-m MODEL] [--effort LEVEL] <task...>' <<<"$HELP"
+if grep -Eq 'subagents (list|kill)([[:space:]]|$)' <<<"$HELP"; then
+	echo "help exposed a removed command alias" >&2
+	exit 1
+fi
+for removed_alias in list kill; do
+	if HOME="$TMP/home" SUBAGENTS_STATE_DIR="$TMP/state" "$CLI" "$removed_alias" >"$TMP/$removed_alias.out" 2>"$TMP/$removed_alias.err"; then
+		echo "removed alias '$removed_alias' unexpectedly succeeded" >&2
+		exit 1
+	fi
+	grep -Fq "unknown command '$removed_alias'" "$TMP/$removed_alias.err"
+done
 
 if env -u TMUX -u TMUX_PANE HOME="$TMP/home" SUBAGENTS_STATE_DIR="$TMP/state" "$CLI" run "complete brief" >"$TMP/out" 2>"$TMP/err"; then
 	echo "expected run outside tmux to fail" >&2
@@ -85,6 +96,10 @@ done
 "$CLI" events >"$TMP/events.out" 2>"$TMP/events.err" || exit 1
 "$CLI" reap >"$TMP/reap.out" 2>"$TMP/reap.err" || exit 1
 "$CLI" status >"$TMP/status.out" 2>"$TMP/status.err" || exit 1
+"$CLI" ls >"$TMP/ls.out" 2>"$TMP/ls.err" || exit 1
+"$CLI" peek 1 10 >"$TMP/peek.out" 2>"$TMP/peek.err" || exit 1
+"$CLI" tell 1 "Follow-up smoke message" >"$TMP/tell.out" 2>"$TMP/tell.err" || exit 1
+"$CLI" stop 2 >"$TMP/stop.out" 2>"$TMP/stop.err" || exit 1
 echo 0 >"$TMP/run.rc"
 TMUX_SMOKE
 chmod +x "$TMP/tmux-smoke"
@@ -108,6 +123,10 @@ grep -Fq '/2/reports/1.md' "$TMP/events.out"
 grep -Fqx 'no new reports' "$TMP/reap.out"
 grep -Eq '^#1[[:space:]]+idle$' "$TMP/status.out"
 grep -Eq '^#2[[:space:]]+idle$' "$TMP/status.out"
+grep -Eq '^#1[[:space:]]+alive' "$TMP/ls.out"
+[ -s "$TMP/peek.out" ]
+grep -Fqx 'sent to subagent #1' "$TMP/tell.out"
+grep -Fqx 'stopped subagent #2' "$TMP/stop.out"
 
 TASK_FILE=$(find "$TMP/state" -type f -path '*/1/task' -print -quit)
 [ -n "$TASK_FILE" ]
@@ -115,9 +134,19 @@ AGENT_DIR=${TASK_FILE%/task}
 grep -Fqx 'Inspect the target, implement safely, verify, and report for inherit-smoke' "$AGENT_DIR/task"
 grep -Fq 'complete worker brief' "$AGENT_DIR/protocol.md"
 grep -Fq '@@DONE@@' "$AGENT_DIR/protocol.md"
-for state_file in pane protocol.md result.md sid task; do
+for state_file in pane protocol.md result.md task; do
 	[ -e "$AGENT_DIR/$state_file" ]
 done
+
+QUEUED_EVENT=$(find "$TMP/state" -type f -path '*/.watcher-pending/*.json' -print -quit)
+[ -n "$QUEUED_EVENT" ]
+node - "$QUEUED_EVENT" <<'NODE'
+const fs = require("node:fs");
+const event = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
+if (event.id !== "2" || event.status !== "done") process.exit(1);
+if (!event.reportBody.includes("completed report")) process.exit(1);
+if (!event.completionKey.startsWith("2:done:")) process.exit(1);
+NODE
 
 for args in "$TMP/pi-args.inherit" "$TMP/pi-args.override"; do
 	grep -Fqx -- '--no-extensions' "$args"

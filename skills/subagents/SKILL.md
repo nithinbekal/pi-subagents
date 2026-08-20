@@ -49,8 +49,10 @@ When `-m`/`--model` is absent, the CLI deliberately passes no model flag.
 ## Push workflow (watcher loaded)
 
 1. Start one or more independent agents with `subagents run`.
-2. End the lead turn instead of polling. The watcher calls `subagents events`,
-   injects each new report, and can wake an idle lead.
+2. End the lead turn instead of polling. On each configured interval, the
+   watcher calls `subagents events`; the CLI durably queues each immutable
+   report before marking it seen, then the watcher injects it and can wake an
+   idle lead.
 3. If a report requests input, use `subagents tell <id> ...`, then end the lead
    turn again.
 4. Use `peek` only to diagnose a reported stall. Stop agents that will not be
@@ -75,5 +77,6 @@ finished agents. On timeout or idle, inspect once with `peek`, answer with
   `result.md`, print `@@DONE@@`, and wait for follow-up work.
 - `SUBAGENTS_PI` may name a trusted auth wrapper plus `pi`. Never put credentials
   directly in task briefs, package configuration, or state.
-- See the package README for all environment variables, state layout, tmux
-  requirements, and known Pi coupling.
+- Pi 0.84+ and only the current state/session formats are supported. See the
+  package README for the exact compatibility window, durability guarantee,
+  environment variables, state layout, tmux requirements, and known coupling.

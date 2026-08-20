@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { access, mkdir, mkdtemp, writeFile } from "node:fs/promises";
+import { access, appendFile, mkdir, mkdtemp, readdir, writeFile } from "node:fs/promises";
 import { constants as fsConstants } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
@@ -11,7 +11,7 @@ import {
 	resolveStateDir,
 	subagentsBinCandidates,
 } from "../extensions/config.ts";
-import subagentsWatch from "../extensions/subagents-watch.ts";
+import subagentsWatch, { resolveWatchInterval } from "../extensions/subagents-watch.ts";
 
 test("state directory honors explicit and XDG configuration", () => {
 	const home = "/tmp/example-home";
@@ -31,6 +31,14 @@ test("bin candidates prefer the explicit path and include this package's CLI", a
 	assert.deepEqual(candidates, [explicit, packageCliPath()]);
 	await access(packageCliPath(), fsConstants.X_OK);
 	assert.equal(findSubagentsBin({}), packageCliPath());
+});
+
+test("watch interval accepts only positive finite values", () => {
+	assert.equal(resolveWatchInterval("25"), 25);
+	assert.equal(resolveWatchInterval("25.9"), 25);
+	for (const value of [undefined, "", "0", "0.5", "-1", "nope", "Infinity"]) {
+		assert.equal(resolveWatchInterval(value), 3000);
+	}
 });
 
 test("watcher extension loads and registers lifecycle handlers", async () => {
@@ -59,17 +67,29 @@ test("watcher extension loads and registers lifecycle handlers", async () => {
 	}
 });
 
-test("watcher consumes generic completion events", async () => {
+test("watcher replays the durable CLI spool and acknowledges only Pi 0.84 entries", async () => {
 	const root = await mkdtemp(path.join(tmpdir(), "pi-subagents-delivery-"));
 	const stateDir = path.join(root, "state");
 	const sessionDir = path.join(stateDir, "$9");
+	const pendingDir = path.join(sessionDir, ".watcher-pending");
+	const queuedPath = path.join(pendingDir, "7-done.json");
 	const report = path.join(root, "report.md");
 	const sessionFile = path.join(root, "session.jsonl");
 	const bin = path.join(root, "subagents");
 	await mkdir(path.join(sessionDir, "7"), { recursive: true });
+	await mkdir(pendingDir, { recursive: true });
 	await writeFile(report, "complete report\n");
 	await writeFile(sessionFile, "");
-	await writeFile(bin, `#!/bin/sh\nprintf '7\\tdone\\t%s\\n' '${report}'\n`, { mode: 0o755 });
+	await writeFile(queuedPath, JSON.stringify({
+		id: "7",
+		status: "done",
+		reportPath: report,
+		reportBody: "complete report",
+		completionKey: "7:done:123:16",
+	}));
+	// This simulates a watcher crash after the CLI queued and marked an event but
+	// before the exec callback observed stdout. Replay must come from disk alone.
+	await writeFile(bin, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
 
 	const envKeys = ["SUBAGENTS_BIN", "SUBAGENTS_STATE_DIR", "SUBAGENTS_WATCH_MS", "TMUX", "TMUX_PANE"] as const;
 	const previous = new Map(envKeys.map((key) => [key, process.env[key]]));
@@ -105,6 +125,25 @@ test("watcher consumes generic completion events", async () => {
 			Object.keys(sent[0].message.details as Record<string, unknown>).sort(),
 			["eventId", "id", "reportPath", "status"],
 		);
+
+		const eventId = (sent[0].message.details as { eventId: string }).eventId;
+		await access(queuedPath);
+		await appendFile(sessionFile, `${JSON.stringify({
+			type: "custom_message",
+			customType: "subagent-report",
+			details: { eventId },
+		})}\n`);
+		for (let i = 0; i < 500; i += 1) {
+			try {
+				await access(queuedPath);
+				await new Promise((resolve) => setTimeout(resolve, 10));
+			} catch {
+				break;
+			}
+		}
+		await assert.rejects(access(queuedPath));
+		assert.deepEqual(await readdir(path.join(sessionDir, ".watcher-delivered")), [eventId]);
+		assert.equal(sent.length, 1);
 	} finally {
 		await handlers.get("session_shutdown")?.();
 		for (const key of envKeys) {

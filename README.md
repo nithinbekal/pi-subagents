@@ -19,10 +19,13 @@ supplies the complete worker brief directly as the task text.
 - Bash 3.2 or later
 - tmux; the lead Pi process and every CLI command must run inside the same tmux
   session
-- standard Unix tools: `awk`, `grep`, `cksum`, `stat`, and `tail`
+- Node 22.6 or later
+- a state-directory filesystem that supports atomic rename, hard links, and fsync
+- standard Unix tools: `awk`, `grep`, `cksum`, `ps`, and `tail`
 
 The watcher has no third-party runtime dependency. It uses Node built-ins and
-Pi's provided `@earendil-works/pi-coding-agent` package.
+Pi's provided `@earendil-works/pi-coding-agent` package. Delivery is polling-only
+and does not depend on platform-specific filesystem notification behavior.
 
 ## Try or install
 
@@ -62,7 +65,7 @@ or credentials. The CLI and watcher must resolve the same state directory.
 | `SUBAGENTS_BIN` | watcher | package-local CLI | Explicit executable CLI path. |
 | `SUBAGENTS_WINDOW_NAME` | CLI | `subagents` | tmux window name/prefix used for worker panes. |
 | `SUBAGENTS_WAKE` | watcher | `1` | Set to `0` to inject reports without waking an idle lead. |
-| `SUBAGENTS_WATCH_MS` | watcher | `3000` | Poll interval in milliseconds. Invalid/zero values use 3000. |
+| `SUBAGENTS_WATCH_MS` | watcher | `3000` | Poll interval in milliseconds. Non-positive or invalid values use 3000. |
 
 Use `subagents config` to print the CLI's resolved values. Environment variables
 must be present in both the lead Pi process and shell commands it launches; tmux
@@ -80,8 +83,8 @@ The wrapper is used for interactive worker panes. It should inject
 authentication into the child process and then `exec` its arguments. Keep the
 wrapper and secrets outside this repository.
 
-For compatibility with existing wrappers, `SUBAGENTS_PI` is treated as a
-trusted shell command and intentionally word-split. Shell quoting embedded
+To support auth wrappers, `SUBAGENTS_PI` is treated as a trusted shell command
+and intentionally word-split. Shell quoting embedded
 inside the variable is not a portable argument parser, and command paths with
 spaces are unsupported. Do not set this variable from untrusted input. Tasks,
 model ids, effort values, and generated prompt paths are separately shell-quoted
@@ -141,8 +144,18 @@ workers that fail to write a report.
 ### Push and pull delivery
 
 With `subagents-watch` loaded, use push mode: start workers and end the lead
-turn. The watcher drains `subagents events`, durably spools each report, injects
-a `subagent-report` custom message, and wakes Pi unless `SUBAGENTS_WAKE=0`.
+turn. `subagents events` first snapshots and durably queues each report, then
+advances its detection marker. The polling watcher injects each queued report as
+a `subagent-report` custom message and wakes Pi unless `SUBAGENTS_WAKE=0`.
+
+This ordering closes the CLI-to-watcher crash window: once a completion is
+marked as seen, its immutable report body is already fsynced in the spool. A
+stable completion key deduplicates replay even if the CLI crashes between the
+queue rename and marker write. The watcher retains a spool record until the
+matching Pi session entry is observed and a delivery acknowledgement is fsynced.
+A crash between Pi persistence and acknowledgement can produce a duplicate,
+which is the intentional at-least-once tradeoff; it cannot silently lose the
+report.
 
 Without the watcher, use `subagents wait <id>` or `subagents reap`. Do not run
 those pull consumers while expecting watcher delivery because completion events
@@ -160,13 +173,13 @@ State is session-scoped by tmux's stable session id (`$1`, `$2`, ...):
 $SUBAGENTS_STATE_DIR/
 └── $1/
     ├── .seq
-    ├── .seq.lock/                 # transient id reservation lock
-    ├── .window-lock/              # transient tmux window lock
+    ├── .seq.lock                  # transient id reservation lock file
+    ├── .window.lock               # transient tmux window lock file
     ├── .watcher-pending/          # immutable JSON report spool
     ├── .watcher-delivered/        # delivery acknowledgement ledger
     └── 1/
+        ├── .event.lock            # transient completion-consumer lock file
         ├── pane                   # tmux pane id
-        ├── sid                    # tmux session id
         ├── protocol.md            # generated report protocol
         ├── task                   # original complete task brief
         ├── result.md              # mutable current report
@@ -174,28 +187,39 @@ $SUBAGENTS_STATE_DIR/
         └── detection markers      # hashes/counters used by events/wait
 ```
 
+The three lock sites use one hard-link lock protocol. Owner metadata is
+published atomically, live owners are never evicted based on age, and a recovery
+link serializes abandoned-lock takeover. Recovery is reported on stderr;
+`doctor` also reports abandoned or unsupported lock state. If a process dies
+inside the takeover itself, the recovery link is left in place and later callers
+fail closed rather than risk concurrent ownership; after confirming no CLI is
+running, remove that reported recovery link manually.
+
 Tasks, pane captures, and reports may contain sensitive project information.
 Protect the state directory accordingly and clean orphaned tmux session
 directories when they are no longer needed. `subagents stop` removes a worker
 directory; watcher delivery markers are retained for seven days.
 
-## Known Pi and platform coupling
+## Compatibility window and coupling
+
+This release supports Pi 0.84 and later, the state layout shown above, and the
+Pi v3 top-level `custom_message` session entry written by Pi 0.84+. State layouts
+from earlier package releases and pre-0.84 Pi/session message shapes are not
+supported or migrated. Stop the affected workers and clear their package state
+before upgrading across that boundary.
 
 The reusable protocol and tmux orchestration are generic, but this version is
-still intentionally coupled in these places:
+intentionally coupled in these places:
 
 - The launcher assumes Pi's current CLI flags (`--append-system-prompt`,
   `--no-extensions`, `--no-skills`, `--no-prompt-templates`,
   `--no-context-files`, model/thinking flags) and its interactive
   Enter-to-submit behavior.
 - The watcher imports Pi's `ExtensionAPI`, uses `sendMessage` with
-  `deliverAs: "steer"`, and recognizes Pi's persisted legacy and v3 custom
-  session-message records for delivery acknowledgement.
+  `deliverAs: "steer"`, and acknowledges the persisted Pi 0.84+ v3
+  `custom_message` shape.
 - Idle detection filters text from Pi's current terminal banner. It is a
   fallback and may need updates when Pi's TUI changes.
-- Recursive `fs.watch` is used for low-latency notifications where the platform
-  supports it. The polling interval remains the portability and reliability
-  fallback.
 - tmux session ids scope state. Moving a running lead between tmux sessions does
   not migrate workers or state.
 
@@ -207,16 +231,18 @@ watcher without the package-local CLI must set `SUBAGENTS_BIN` explicitly.
 No install step is required on a recent Node release:
 
 ```bash
-bash -n skills/subagents/subagents
+bash -n skills/subagents/subagents tests/*.sh
 node --experimental-strip-types --test tests/*.test.ts
 bash tests/cli-smoke.sh
+bash tests/cli-reliability.sh
 bash tests/public-safety.sh
 ```
 
-Or run all checks with `npm test` in an environment where npm is available. The
-tests cover environment/path resolution, package-local CLI discovery, direct
-task launching with inherited and explicit models, extension factory
-registration, tmux smoke behavior, and public-package safety.
+Or run all checks with `pnpm test`. The tests cover environment/path resolution,
+package-local CLI discovery, direct task launching with inherited and explicit
+models, polling watcher replay and acknowledgement, concurrent lock ownership
+and abandoned-lock recovery, queue-before-marker crash ordering, tmux command
+smoke behavior, and public-package safety.
 
 ## License
 

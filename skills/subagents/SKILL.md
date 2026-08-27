@@ -1,82 +1,108 @@
 ---
 name: subagents
 description: >-
-  Delegate complete task briefs to isolated Pi agents in tmux panes, send
-  follow-up messages, and collect completion reports. Use for parallel or
-  context-heavy work when Pi is running inside tmux.
-compatibility: Requires bash, tmux, and the Pi coding-agent CLI.
+  Delegate complete task briefs to isolated Pi workers in tmux panes, send
+  lifecycle-safe follow-ups, and receive durable completion reports.
+compatibility: Requires Bash, Node 22.6+, tmux, and Pi 0.84+.
 ---
 
 # Subagents
 
-Run focused Pi agents in a dedicated tmux window. Each agent has an isolated
-context and a pane title of `subagent#<id>`. The lead communicates through the
-CLI and receives reports through the watcher extension or pull commands.
-
-Resolve the executable beside this file and invoke it by absolute path. The
-examples below use `subagents` for readability.
+Run focused Pi workers in a dedicated tmux window. Each worker has an isolated
+context and a pane title such as `subagent#1`. Resolve the executable beside this
+file and invoke it by absolute path; examples use `subagents` for readability.
 
 ## Before delegating
 
-1. Run `subagents doctor` after installation or configuration changes. Fix each
-   `FAIL`; warnings identify stale state.
-2. Write the task as a complete worker brief. Include the objective, relevant
-   paths and context, constraints, expected verification, and reporting or
-   shipping requirements. Workers do not inherit the lead's conversation or
-   discovered context files.
-3. Usually omit `-m` so the new Pi process uses the launcher's current/default
-   model. Pass `-m provider/model` only when the spawning agent deliberately
-   chooses another model.
+1. Run `subagents doctor` after installation, upgrades, or configuration
+   changes. Fix every `FAIL`. Protocol/state mismatches are intentionally not
+   migrated or ignored.
+2. Write a complete worker brief with the objective, relevant paths and facts,
+   constraints, verification, and shipping requirements. Workers do not inherit
+   the lead conversation or discovered context files.
+3. Usually omit `-m`. Commands launched by Pi expose the effective
+   `PI_PROVIDER`, `PI_MODEL`, and `PI_REASONING_LEVEL`; the CLI carries those
+   values explicitly through tmux. Use `-m provider/model` or `--effort LEVEL`
+   only for a deliberate override.
 
 ## Commands
 
 ```bash
+subagents protocol
 subagents config
 subagents doctor
 subagents run [-m provider/model] [--effort LEVEL] "<complete task brief>"
-subagents tell <id> "<message>"
+subagents tell <id> "<follow-up>"
+subagents retain <id>
+subagents release <id>
 subagents status
 subagents peek <id> [lines]
 subagents ls
+subagents cleanup
 subagents stop <id|--all>
+subagents purge <id|--all>
 subagents wait <id> [seconds]
 subagents reap
 ```
 
-`--effort` accepts Pi's thinking levels. Model ids must be provider-qualified.
-When `-m`/`--model` is absent, the CLI deliberately passes no model flag.
+`retain` durably cancels cleanup until `release`. `tell` also cancels cleanup,
+advances the worker generation, and sends generation-specific publication
+instructions before reporting success. Use these commands instead of typing
+into the pane.
 
-## Push workflow (watcher loaded)
+## Push workflow
 
-1. Start one or more independent agents with `subagents run`.
-2. End the lead turn instead of polling. On each configured interval, the
-   watcher calls `subagents events`; the CLI durably queues each immutable
-   report before marking it seen, then the watcher injects it and can wake an
-   idle lead.
-3. If a report requests input, use `subagents tell <id> ...`, then end the lead
-   turn again.
-4. Use `peek` only to diagnose a reported stall. Stop agents that will not be
-   reused.
+1. Start independent workers with `subagents run`.
+2. End the lead turn instead of polling. The watcher validates the CLI and state
+   protocol, runs `subagents events`, replays the durable report spool, and
+   wakes an idle lead unless `SUBAGENTS_WAKE=0`.
+3. A `completed` report leaves the worker awaiting follow-up. A `blocked` report
+   requests input and is never an automatic cleanup candidate.
+4. Use `subagents tell <id> ...` for follow-up, then end the lead turn again.
+5. Use `peek` only for diagnosis. Screen stability is not completion.
 
-Do not combine watcher mode with `wait` or `reap`: those pull commands consume
-the same completion events.
+Delivery is at least once. The watcher acknowledges only after the matching Pi
+0.84+ custom message is present in the persisted lead session. A crash can
+produce a duplicate, but a queued report is not silently lost.
 
-## Pull fallback (watcher not loaded)
+## Pull fallback
 
-Use `subagents wait <id>` for one agent or `subagents reap` for all newly
-finished agents. On timeout or idle, inspect once with `peek`, answer with
-`tell`, and wait again.
+Without the watcher, use `subagents wait <id>` or `subagents reap`. Pull commands
+print an immutable queued report before acknowledging it. Do not intentionally
+mix push and pull consumers for the same lead session.
+
+## Publication and cleanup guarantees
+
+The generated worker protocol supplies explicit `completed` and `blocked`
+publication commands for the current lifecycle generation. The CLI snapshots
+and fsyncs the complete report, fsyncs a versioned spool event, and only then
+commits lifecycle completion. A report file, `@@DONE@@`, quiet output, or a
+stable pane is not sufficient.
+
+Automatic cleanup defaults to `on` with a 600-second grace. It can stop only a
+durably completed, unretained `awaiting-follow-up` worker whose complete report
+is queued or acknowledged. It performs a second lease check under the worker
+event lock. Working, blocked, retained, exited, unknown, missing, malformed, and
+screen-stable workers are protected.
+
+Configure cleanup with:
+
+- `SUBAGENTS_CLEANUP_MODE=on|off|dry-run|notify`
+- `SUBAGENTS_CLEANUP_GRACE_SECONDS=<non-negative seconds>`
+
+Cleanup and `stop` preserve reports, spool, acknowledgements, and lifecycle
+state. `purge` is separate and refuses to delete unacknowledged or unpublished
+reports.
 
 ## Operational notes
 
 - Every command and watcher instance is scoped to the current tmux session.
-- The CLI starts subagents with `--no-extensions --no-skills
-  --no-prompt-templates --no-context-files --no-session`; Pi's built-in tools
-  remain available.
-- The report protocol requires the subagent to overwrite its assigned
-  `result.md`, print `@@DONE@@`, and wait for follow-up work.
-- `SUBAGENTS_PI` may name a trusted auth wrapper plus `pi`. Never put credentials
-  directly in task briefs, package configuration, or state.
-- Pi 0.84+ and only the current state/session formats are supported. See the
-  package README for the exact compatibility window, durability guarantee,
-  environment variables, state layout, tmux requirements, and known coupling.
+- Workers start with `--no-extensions --no-skills --no-prompt-templates
+  --no-context-files --no-session`; Pi's built-in coding tools remain available.
+- `SUBAGENTS_PI` may be a trusted authentication wrapper plus `pi`. Keep
+  credentials outside task briefs, configuration committed to the package, and
+  package state.
+- `status` and `ls` avoid task text. State and reports can still contain
+  sensitive project data; protect the state directory.
+- Pi 0.84+ and package state schema 1 are the only supported formats. See the
+  package README and `docs/state.md` for exact durability and lifecycle details.

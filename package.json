@@ -1,7 +1,7 @@
 {
   "name": "pi-subagents",
-  "version": "0.2.0",
-  "description": "Tmux-based isolated Pi workers with direct task briefs and push report delivery",
+  "version": "0.3.0",
+  "description": "Tmux-based isolated Pi workers with durable report delivery and conservative lifecycle cleanup",
   "type": "module",
   "license": "MIT",
   "keywords": [
@@ -13,14 +13,16 @@
   "files": [
     "extensions",
     "skills",
+    "docs",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "protocol.json"
   ],
   "bin": {
     "subagents": "skills/subagents/subagents"
   },
   "scripts": {
-    "test": "bash -n skills/subagents/subagents tests/*.sh && node --experimental-strip-types --test tests/config.test.ts && bash tests/cli-smoke.sh && bash tests/cli-reliability.sh && bash tests/public-safety.sh"
+    "test": "bash -n skills/subagents/subagents tests/*.sh && node --check skills/subagents/state.mjs && node --experimental-strip-types --test tests/config.test.ts && bash tests/cli-smoke.sh && bash tests/cli-reliability.sh && bash tests/cli-lifecycle.sh && bash tests/public-safety.sh"
   },
   "pi": {
     "extensions": [

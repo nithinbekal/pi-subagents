@@ -1,0 +1,9 @@
+{
+  "protocolId": "pi-subagents",
+  "packageVersion": "0.3.0",
+  "cliApiVersion": 1,
+  "watcherApiVersion": 1,
+  "stateSchemaVersion": 1,
+  "eventSchemaVersion": 1,
+  "lifecycleSchemaVersion": 1
+}

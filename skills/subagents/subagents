@@ -31,7 +31,7 @@ STATE_DIR="${SUBAGENTS_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/subagent
 WIN_PREFIX="${SUBAGENTS_WINDOW_NAME:-subagents}"
 SENTINEL="@@DONE@@"
 DEFAULT_WAIT=120
-PACKAGE_VERSION="0.3.0"
+PACKAGE_VERSION="0.3.1"
 PROTOCOL_ID="pi-subagents"
 CLI_API_VERSION=1
 WATCHER_API_VERSION=1
@@ -444,6 +444,10 @@ the completion spool, and only then commits lifecycle completion. It also keeps
 the latest published report at $result. Do not publish completed when you still
 need input. Never answer only in chat. Missing/malformed lifecycle or a report
 that was written but not published is deliberately treated as still working.
+
+Keep routine reports to 25 lines or fewer. Start with Done or Blocked, then list
+what changed, checks run with results, and artifact paths. Include more lines
+only when commands, test output, errors, diffs, or links are needed as evidence.
 EOF
 }
 
@@ -455,6 +459,107 @@ provider_model() {
 
 valid_effort() {
 	case "$1" in off|minimal|low|medium|high|xhigh|max) return 0 ;; *) return 1 ;; esac
+}
+
+launcher_binary() {
+	local -a launcher_parts=()
+	read -r -a launcher_parts <<<"$PI_CMD"
+	printf '%s' "${launcher_parts[0]:-}"
+}
+
+run_doctor_preflight() {
+	local launcher_bin session_id
+	# Package and protocol identity are validated before command dispatch.
+	launcher_bin=$(launcher_binary)
+	[ -n "$launcher_bin" ] && command -v "$launcher_bin" >/dev/null 2>&1 \
+		|| die "doctor preflight failed: launcher command not found: ${launcher_bin:-<empty>}"
+	command -v tmux >/dev/null 2>&1 || die "doctor preflight failed: tmux command not found"
+	in_tmux || die "doctor preflight failed: subagents requires tmux"
+	session_id=$(current_session_id)
+	valid_session_id "$session_id" || die "doctor preflight failed: unexpected tmux session id '$session_id'"
+}
+
+validate_model_id() {
+	local requested="$1" suggestions rc
+	suggestions=$(node - "$PI_CMD" "$requested" <<'NODE'
+const { spawnSync } = require("node:child_process");
+const [launcher, requested] = process.argv.slice(2);
+const parts = launcher.trim().split(/\s+/).filter(Boolean);
+if (parts.length === 0) process.exit(2);
+const result = spawnSync(parts[0], [...parts.slice(1), "--list-models"], {
+	encoding: "utf8",
+	timeout: 850,
+	maxBuffer: 5 * 1024 * 1024,
+	env: process.env,
+});
+if (result.error || result.status !== 0 || !result.stdout) process.exit(2);
+const models = result.stdout.split("\n").flatMap((line) => {
+	const columns = line.trim().split(/\s+/);
+	if (columns.length < 2 || columns[0] === "provider") return [];
+	return [`${columns[0]}/${columns[1]}`];
+});
+if (models.length === 0) process.exit(2);
+if (models.includes(requested)) process.exit(0);
+
+const uniqueModels = new Map();
+for (const entry of models) {
+	const separator = entry.indexOf("/");
+	const provider = entry.slice(0, separator);
+	const model = entry.slice(separator + 1);
+	const previous = uniqueModels.get(model);
+	if (!previous || provider.length < previous.slice(0, previous.indexOf("/")).length) uniqueModels.set(model, entry);
+}
+const tokenize = (value) => value.toLowerCase().match(/[a-z0-9]+/g) ?? [];
+const requestedProvider = requested.slice(0, requested.indexOf("/"));
+const requestedModel = requested.slice(requested.indexOf("/") + 1);
+const requestedTokens = tokenize(requestedModel);
+const lastToken = requestedTokens.at(-1);
+const candidates = [...uniqueModels.values()];
+const frequencies = new Map();
+for (const candidate of candidates) {
+	const tokens = new Set(tokenize(candidate.slice(candidate.indexOf("/") + 1)));
+	for (const token of tokens) frequencies.set(token, (frequencies.get(token) ?? 0) + 1);
+}
+function distance(left, right) {
+	let previous = Array.from({ length: right.length + 1 }, (_, index) => index);
+	for (let i = 1; i <= left.length; i += 1) {
+		const current = [i];
+		for (let j = 1; j <= right.length; j += 1) {
+			current[j] = Math.min(current[j - 1] + 1, previous[j] + 1, previous[j - 1] + (left[i - 1] === right[j - 1] ? 0 : 1));
+		}
+		previous = current;
+	}
+	return previous[right.length];
+}
+const ranked = candidates.map((candidate) => {
+	const separator = candidate.indexOf("/");
+	const provider = candidate.slice(0, separator);
+	const model = candidate.slice(separator + 1);
+	const tokens = new Set(tokenize(model));
+	let score = provider === requestedProvider ? 5 : 0;
+	for (const token of new Set(requestedTokens)) {
+		if (tokens.has(token)) score += Math.log((candidates.length + 1) / ((frequencies.get(token) ?? 0) + 1)) * 10;
+	}
+	if (lastToken && tokens.has(lastToken)) score += 100;
+	score -= (distance(requestedModel, model) / Math.max(requestedModel.length, model.length, 1)) * 10;
+	return { candidate, score };
+}).sort((left, right) => right.score - left.score || left.candidate.localeCompare(right.candidate));
+process.stdout.write(ranked.slice(0, 3).map(({ candidate }) => candidate).join(", "));
+process.exit(3);
+NODE
+); rc=$?
+	case "$rc" in
+		0) return 0 ;;
+		2)
+			echo "subagents: warning: Pi model catalog unavailable within 850ms; skipping validation for '$requested'" >&2
+			return 0
+			;;
+		3) die "model '$requested' was not found in Pi's model catalog. Closest matches: ${suggestions:-none}" ;;
+		*)
+			echo "subagents: warning: Pi model catalog validation failed; skipping validation for '$requested'" >&2
+			return 0
+			;;
+	esac
 }
 
 # ---- immutable snapshots and durable completion spool --------------------
@@ -748,11 +853,9 @@ cmd_config() {
 cmd_doctor() {
 	local failures=0 warnings=0 orphan_sessions=0 root count dir name pane pane_session launcher_bin session_id
 	local lock_path lock_label event_file
-	local -a launcher_parts=()
 	session_id=$(current_session_id)
 	root=$(sr)
-	read -r -a launcher_parts <<<"$PI_CMD"
-	launcher_bin="${launcher_parts[0]:-}"
+	launcher_bin=$(launcher_binary)
 	if [ -n "$launcher_bin" ] && command -v "$launcher_bin" >/dev/null 2>&1; then echo "ok   launcher: $launcher_bin"; else
 		echo "FAIL launcher: command not found: ${launcher_bin:-<empty>}"; failures=$((failures + 1))
 	fi
@@ -821,6 +924,7 @@ cmd_run() {
 	[ -n "$task" ] || die "usage: subagents run [-m MODEL] [--effort LEVEL] <task...>"
 	if [ -n "$model_override" ] && ! provider_model "$model_override"; then die "model '$model_override' is not provider-qualified (expected provider/model)"; fi
 	if [ -n "$effort_override" ] && ! valid_effort "$effort_override"; then die "invalid effort '$effort_override'"; fi
+	run_doctor_preflight
 	if [ -z "$model_override" ]; then
 		if [ -n "$inherited_provider" ] || [ -n "$inherited_model" ]; then
 			[ -n "$inherited_provider" ] && [ -n "$inherited_model" ] || die "PI_PROVIDER/PI_MODEL inheritance is incomplete"
@@ -835,7 +939,10 @@ cmd_run() {
 		launch_model="$model_override"
 	fi
 	[ -z "$effort_override" ] || launch_effort="$effort_override"
-	if [ -n "$launch_model" ]; then launch_provider=${launch_model%%/*}; launch_model_id=${launch_model#*/}; fi
+	if [ -n "$launch_model" ]; then
+		launch_provider=${launch_model%%/*}; launch_model_id=${launch_model#*/}
+		validate_model_id "$launch_model"
+	fi
 
 	session_id=$(current_session_id)
 	id=$(reserve_id) || die "failed to reserve subagent id"

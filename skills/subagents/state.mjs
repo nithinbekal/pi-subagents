@@ -6,7 +6,7 @@ import * as path from "node:path";
 
 const PROTOCOL = Object.freeze({
 	protocolId: "pi-subagents",
-	packageVersion: "0.3.0",
+	packageVersion: "0.3.1",
 	cliApiVersion: 1,
 	watcherApiVersion: 1,
 	stateSchemaVersion: 1,

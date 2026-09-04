@@ -22,11 +22,11 @@ grep -Fqx 'window_name=helpers' <<<"$CONFIG"
 grep -Fqx 'cleanup_mode=on' <<<"$CONFIG"
 grep -Fqx 'cleanup_grace_seconds=600' <<<"$CONFIG"
 grep -Fqx 'protocol_id=pi-subagents' <<<"$CONFIG"
-grep -Fqx 'package_version=0.3.0' <<<"$CONFIG"
+grep -Fqx 'package_version=0.3.1' <<<"$CONFIG"
 [ "$(wc -l <<<"$CONFIG" | tr -d ' ')" = 7 ]
 
 PROTOCOL=$(HOME="$TMP/home" "$CLI" protocol)
-node -e 'const p=JSON.parse(process.argv[1]); if(p.protocolId!=="pi-subagents"||p.packageVersion!=="0.3.0"||p.watcherApiVersion!==1)process.exit(1)' "$PROTOCOL"
+node -e 'const p=JSON.parse(process.argv[1]); if(p.protocolId!=="pi-subagents"||p.packageVersion!=="0.3.1"||p.watcherApiVersion!==1)process.exit(1)' "$PROTOCOL"
 HELP=$(HOME="$TMP/home" "$CLI" --help)
 grep -Fq 'subagents run [-m MODEL] [--effort LEVEL] <task...>' <<<"$HELP"
 grep -Fq 'subagents retain <id>' <<<"$HELP"
@@ -46,6 +46,16 @@ grep -Fq 'subagents requires tmux' "$TMP/err"
 
 cat >"$TMP/bin/fake-pi" <<FAKE_PI
 #!/bin/sh
+if [ "\${1:-}" = "--list-models" ]; then
+	[ "\${FAKE_PI_CATALOG_UNAVAILABLE:-}" != 1 ] || exit 2
+	printf '%s\n' \
+		'provider model context max-out thinking images' \
+		'lead-provider lead-model 1M 128K yes yes' \
+		'example-provider example-model 1M 128K yes yes' \
+		'example-provider no-effort 1M 128K yes yes' \
+		'anthropic claude-fable-5-1 1M 128K yes yes'
+	exit 0
+fi
 last=""
 protocol=""
 next_is_protocol=0
@@ -92,10 +102,11 @@ cd "$ROOT"
 "$CLI" run --model example-provider/example-model --effort high "Implement and verify override-smoke" >"$TMP/run-override.out" 2>"$TMP/run-override.err"
 "$CLI" run --model example-provider/no-effort "Investigate and request input for blocked-smoke" >"$TMP/run-blocked.out" 2>"$TMP/run-blocked.err"
 if "$CLI" run -m unqualified "invalid model" >"$TMP/run-invalid.out" 2>"$TMP/run-invalid.err"; then exit 1; fi
+if "$CLI" run -m openai/gpt-5.6-fable "unknown qualified model" >"$TMP/run-unknown-model.out" 2>"$TMP/run-unknown-model.err"; then exit 1; fi
 "$CLI" doctor >"$TMP/doctor.out" 2>"$TMP/doctor.err"
 if SUBAGENTS_PI="$TMP/bin/missing-pi" "$CLI" run "launcher failure must be surfaced" >"$TMP/run-launch-fail.out" 2>"$TMP/run-launch-fail.err"; then exit 1; fi
-grep -Fq 'worker launcher exited during startup for subagent #4' "$TMP/run-launch-fail.err"
-"$CLI" purge 4 >"$TMP/purge-launch-fail.out" 2>"$TMP/purge-launch-fail.err"
+grep -Fq 'doctor preflight failed: launcher command not found' "$TMP/run-launch-fail.err"
+FAKE_PI_CATALOG_UNAVAILABLE=1 "$CLI" run "Catalog unavailable warning-smoke" >"$TMP/run-catalog-warning.out" 2>"$TMP/run-catalog-warning.err"
 "$CLI" wait 1 10 >"$TMP/wait.out" 2>"$TMP/wait.err"
 "$CLI" events >"$TMP/events.out" 2>"$TMP/events.err"
 "$CLI" reap >"$TMP/reap.out" 2>"$TMP/reap.err"
@@ -109,6 +120,7 @@ grep -Fq 'worker launcher exited during startup for subagent #4' "$TMP/run-launc
 "$CLI" purge 2 >"$TMP/purge.out" 2>"$TMP/purge.err"
 "$CLI" stop 1 >"$TMP/stop1.out" 2>"$TMP/stop1.err"
 "$CLI" stop 3 >"$TMP/stop3.out" 2>"$TMP/stop3.err"
+"$CLI" stop 4 >"$TMP/stop4.out" 2>"$TMP/stop4.err"
 echo 0 >"$TMP/run.rc"
 TMUX_SMOKE
 chmod +x "$TMP/tmux-smoke"
@@ -128,8 +140,11 @@ grep -Fq 'model lead-provider/lead-model, effort medium' "$TMP/run-inherit.out"
 grep -Fq 'model example-provider/example-model, effort high' "$TMP/run-override.out"
 grep -Fq 'model example-provider/no-effort' "$TMP/run-blocked.out"
 grep -Fq "model 'unqualified' is not provider-qualified" "$TMP/run-invalid.err"
-grep -Fq 'worker launcher exited during startup for subagent #4' "$TMP/run-launch-fail.err"
-grep -Fqx 'purged subagent #4 after report acknowledgement' "$TMP/purge-launch-fail.out"
+grep -Fq "model 'openai/gpt-5.6-fable' was not found in Pi's model catalog" "$TMP/run-unknown-model.err"
+grep -Fq 'Closest matches: anthropic/claude-fable-5-1' "$TMP/run-unknown-model.err"
+grep -Fq 'doctor preflight failed: launcher command not found' "$TMP/run-launch-fail.err"
+grep -Fq 'Pi model catalog unavailable within 850ms; skipping validation' "$TMP/run-catalog-warning.err"
+grep -Fq 'started subagent #4' "$TMP/run-catalog-warning.out"
 grep -Fqx 'doctor: healthy' "$TMP/doctor.out"
 grep -Fq '=== subagent #1 report (done) ===' "$TMP/wait.out"
 grep -Fq 'completed report for Inspect' "$TMP/wait.out"
@@ -152,6 +167,8 @@ TASK_FILE=$(find "$TMP/state" -type f -path '*/1/task' -print -quit)
 AGENT_DIR=${TASK_FILE%/task}
 grep -Fqx 'Inspect, implement, verify, and report for inherit-smoke' "$AGENT_DIR/task"
 grep -Fq 'complete' "$AGENT_DIR/protocol.md"
+grep -Fq 'Keep routine reports to 25 lines or fewer' "$AGENT_DIR/protocol.md"
+grep -Fq 'what changed, checks run with results, and artifact paths' "$AGENT_DIR/protocol.md"
 grep -Fq 'publish 1 completed' "$AGENT_DIR/protocol.md"
 grep -Fq 'publish 1 blocked' "$AGENT_DIR/protocol.md"
 grep -Fq '@@DONE@@' "$AGENT_DIR/protocol.md"
@@ -162,7 +179,7 @@ ARCHIVED_EVENT=$(find "$TMP/state" -type f -path '*/1/events/*.json' -print -qui
 node - "$ARCHIVED_EVENT" <<'NODE'
 const fs = require("node:fs");
 const event = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
-if (event.protocolId !== "pi-subagents" || event.packageVersion !== "0.3.0" || event.schemaVersion !== 1) process.exit(1);
+if (event.protocolId !== "pi-subagents" || event.packageVersion !== "0.3.1" || event.schemaVersion !== 1) process.exit(1);
 if (event.id !== "1" || event.generation !== 1 || event.status !== "done" || event.outcome !== "completed") process.exit(1);
 if (!event.reportBody.includes("completed report")) process.exit(1);
 NODE

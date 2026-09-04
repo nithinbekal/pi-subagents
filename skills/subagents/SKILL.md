@@ -23,7 +23,9 @@ file and invoke it by absolute path; examples use `subagents` for readability.
 3. Usually omit `-m`. Commands launched by Pi expose the effective
    `PI_PROVIDER`, `PI_MODEL`, and `PI_REASONING_LEVEL`; the CLI carries those
    values explicitly through tmux. Use `-m provider/model` or `--effort LEVEL`
-   only for a deliberate override.
+   only for a deliberate override. `run` performs a lightweight doctor preflight
+   and rejects unknown models with close matches. If Pi's catalog is unavailable
+   within 850 ms, it warns and continues.
 
 ## Commands
 
@@ -54,8 +56,9 @@ into the pane.
 
 1. Start independent workers with `subagents run`.
 2. End the lead turn instead of polling. The watcher validates the CLI and state
-   protocol, runs `subagents events`, replays the durable report spool, and
-   wakes an idle lead unless `SUBAGENTS_WAKE=0`.
+   protocol, uses filesystem events plus polling to run `subagents events`,
+   replays the durable report spool, and wakes an idle lead unless
+   `SUBAGENTS_WAKE=0`.
 3. A `completed` report leaves the worker awaiting follow-up. A `blocked` report
    requests input and is never an automatic cleanup candidate.
 4. Use `subagents tell <id> ...` for follow-up, then end the lead turn again.

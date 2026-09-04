@@ -191,6 +191,7 @@ export default function subagentsWatch(pi: ExtensionAPI) {
 	let draining = false;
 	let pendingDrain = false;
 	let timer: ReturnType<typeof setInterval> | null = null;
+	let watcher: fs.FSWatcher | null = null;
 	let scheduledDrain: ReturnType<typeof setTimeout> | null = null;
 	let scheduledDrainAt = 0;
 	let drainPromise: Promise<void> | null = null;
@@ -488,6 +489,17 @@ export default function subagentsWatch(pi: ExtensionAPI) {
 		active = true;
 		timer = setInterval(() => scheduleDrain(0), intervalMs);
 		if (typeof timer.unref === "function") timer.unref();
+		try {
+			watcher = fs.watch(sessionDir, { recursive: true }, (_eventType, filename) => {
+				const changedPath = filename?.toString();
+				if (!changedPath || changedPath.includes(".watcher-pending") || changedPath.endsWith("lifecycle.json")) {
+					scheduleDrain(50);
+				}
+			});
+			watcher.on("error", () => {});
+		} catch {
+			/* Polling remains the delivery safety net when filesystem watching is unavailable. */
+		}
 		scheduleDrain(0);
 	};
 
@@ -496,6 +508,10 @@ export default function subagentsWatch(pi: ExtensionAPI) {
 		pendingDrain = false;
 		context = null;
 		if (timer) { clearInterval(timer); timer = null; }
+		if (watcher) {
+			try { watcher.close(); } catch { /* ignore watcher close errors */ }
+			watcher = null;
+		}
 		if (scheduledDrain) {
 			clearTimeout(scheduledDrain);
 			scheduledDrain = null;

@@ -1,10 +1,10 @@
 # State, event, and lifecycle protocol
 
-This document describes pi-subagents 0.3.0. The authoritative identity is
+This document describes pi-subagents 0.3.1. The authoritative identity is
 `protocol.json`:
 
 - protocol: `pi-subagents`
-- package: `0.3.0`
+- package: `0.3.1`
 - CLI API: `1`
 - watcher API: `1`
 - session state schema: `1`

@@ -6,6 +6,7 @@
 #   subagents protocol                  Print the package/CLI/watcher protocol identity as JSON.
 #   subagents config                    Print resolved launcher, state, cleanup, and protocol configuration.
 #   subagents doctor                    Validate the launcher, tmux, schema, locks, and worker state.
+#   subagents models [--refresh]        Print accepted provider/model ids; optionally rebuild the cache.
 #   subagents run [-m MODEL] [--effort LEVEL] <task...>
 #                                       Start a worker with a complete task brief. Without -m,
 #                                       inherit PI_PROVIDER/PI_MODEL and PI_REASONING_LEVEL from
@@ -31,7 +32,7 @@ STATE_DIR="${SUBAGENTS_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/subagent
 WIN_PREFIX="${SUBAGENTS_WINDOW_NAME:-subagents}"
 SENTINEL="@@DONE@@"
 DEFAULT_WAIT=120
-PACKAGE_VERSION="0.3.1"
+PACKAGE_VERSION="0.3.2"
 PROTOCOL_ID="pi-subagents"
 CLI_API_VERSION=1
 WATCHER_API_VERSION=1
@@ -39,6 +40,9 @@ STATE_SCHEMA_VERSION=1
 EVENT_SCHEMA_VERSION=1
 LIFECYCLE_SCHEMA_VERSION=1
 DEFAULT_CLEANUP_GRACE_SECONDS=600
+MODEL_CACHE_TTL_SECONDS=86400
+MODEL_CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/pi-subagents/models.tsv"
+CUSTOM_MODELS="$HOME/.pi/agent/models.json"
 CLEANUP_MODE="${SUBAGENTS_CLEANUP_MODE:-on}"
 CLEANUP_GRACE_SECONDS="${SUBAGENTS_CLEANUP_GRACE_SECONDS:-$DEFAULT_CLEANUP_GRACE_SECONDS}"
 SCRIPT_DIR=$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -479,47 +483,148 @@ run_doctor_preflight() {
 	valid_session_id "$session_id" || die "doctor preflight failed: unexpected tmux session id '$session_id'"
 }
 
-validate_model_id() {
-	local requested="$1" suggestions rc
-	suggestions=$(node - "$PI_CMD" "$requested" <<'NODE'
+model_cache_is_fresh() {
+	local mtime now
+	[ -s "$MODEL_CACHE" ] || return 1
+	mtime=$(stat -c %Y "$MODEL_CACHE" 2>/dev/null || stat -f %m "$MODEL_CACHE" 2>/dev/null || true)
+	now=$(date +%s)
+	case "$mtime" in ''|*[!0-9]*) return 1 ;; esac
+	[ $((now - mtime)) -lt "$MODEL_CACHE_TTL_SECONDS" ]
+}
+
+refresh_model_cache() {
+	local pi_path
+	local -a command_parts=()
+	if pi_path=$(command -v pi 2>/dev/null) && [ -n "$pi_path" ]; then
+		command_parts=("$pi_path")
+	else
+		read -r -a command_parts <<<"$PI_CMD"
+	fi
+	[ "${#command_parts[@]}" -gt 0 ] || return 2
+	node - "$MODEL_CACHE" "${command_parts[@]}" <<'NODE'
+const { randomUUID } = require("node:crypto");
+const fs = require("node:fs");
+const path = require("node:path");
 const { spawnSync } = require("node:child_process");
-const [launcher, requested] = process.argv.slice(2);
-const parts = launcher.trim().split(/\s+/).filter(Boolean);
-if (parts.length === 0) process.exit(2);
-const result = spawnSync(parts[0], [...parts.slice(1), "--list-models"], {
+const [target, executable, ...args] = process.argv.slice(2);
+const result = spawnSync(executable, [...args, "--list-models"], {
 	encoding: "utf8",
-	timeout: 850,
+	timeout: 5000,
 	maxBuffer: 5 * 1024 * 1024,
 	env: process.env,
 });
 if (result.error || result.status !== 0 || !result.stdout) process.exit(2);
-const models = result.stdout.split("\n").flatMap((line) => {
+const entries = new Set();
+let sawHeader = false;
+for (const line of result.stdout.split("\n")) {
 	const columns = line.trim().split(/\s+/);
-	if (columns.length < 2 || columns[0] === "provider") return [];
-	return [`${columns[0]}/${columns[1]}`];
-});
-if (models.length === 0) process.exit(2);
-if (models.includes(requested)) process.exit(0);
+	if (columns[0] === "provider" && columns[1] === "model") { sawHeader = true; continue; }
+	if (!sawHeader || columns.length < 6) continue;
+	if (columns[0].includes("/") || columns[1].includes("\t")) continue;
+	entries.add(`${columns[0]}\t${columns[1]}`);
+}
+if (entries.size === 0) process.exit(2);
+const contents = `${[...entries].sort().join("\n")}\n`;
+const directory = path.dirname(target);
+fs.mkdirSync(directory, { recursive: true });
+const temporary = path.join(directory, `.models.${process.pid}.${randomUUID()}.tmp`);
+try {
+	fs.writeFileSync(temporary, contents, { encoding: "utf8", mode: 0o600, flag: "wx" });
+	fs.renameSync(temporary, target);
+} catch (error) {
+	try { fs.unlinkSync(temporary); } catch {}
+	process.exit(2);
+}
+NODE
+}
 
-const uniqueModels = new Map();
-for (const entry of models) {
+refresh_model_cache_background() {
+	node - "$CLI_PATH" <<'NODE' >/dev/null 2>&1
+const { spawn } = require("node:child_process");
+const child = spawn(process.argv[2], ["_refresh-model-cache"], {
+	detached: true,
+	stdio: "ignore",
+	env: process.env,
+});
+child.unref();
+NODE
+}
+
+ensure_model_cache() {
+	local force="${1:-0}"
+	if [ "$force" = 1 ]; then
+		refresh_model_cache
+	elif model_cache_is_fresh; then
+		refresh_model_cache_background
+		return 0
+	else
+		refresh_model_cache
+	fi
+}
+
+print_model_catalog() {
+	node - "$MODEL_CACHE" "$CUSTOM_MODELS" <<'NODE'
+const fs = require("node:fs");
+const [cachePath, customPath] = process.argv.slice(2);
+const models = new Set();
+try {
+	for (const line of fs.readFileSync(cachePath, "utf8").split("\n")) {
+		const [provider, model, ...rest] = line.split("\t");
+		if (provider && model && rest.length === 0) models.add(`${provider}/${model}`);
+	}
+} catch {}
+try {
+	const providers = JSON.parse(fs.readFileSync(customPath, "utf8")).providers;
+	if (providers && typeof providers === "object") {
+		for (const [provider, config] of Object.entries(providers)) {
+			if (!config || !Array.isArray(config.models)) continue;
+			for (const model of config.models) {
+				if (model && typeof model.id === "string" && model.id) models.add(`${provider}/${model.id}`);
+			}
+		}
+	}
+} catch {}
+if (models.size === 0) process.exit(2);
+console.log("provider\tmodel");
+for (const entry of [...models].sort()) {
 	const separator = entry.indexOf("/");
-	const provider = entry.slice(0, separator);
-	const model = entry.slice(separator + 1);
-	const previous = uniqueModels.get(model);
-	if (!previous || provider.length < previous.slice(0, previous.indexOf("/")).length) uniqueModels.set(model, entry);
+	console.log(`${entry.slice(0, separator)}\t${entry.slice(separator + 1)}`);
 }
-const tokenize = (value) => value.toLowerCase().match(/[a-z0-9]+/g) ?? [];
-const requestedProvider = requested.slice(0, requested.indexOf("/"));
-const requestedModel = requested.slice(requested.indexOf("/") + 1);
-const requestedTokens = tokenize(requestedModel);
-const lastToken = requestedTokens.at(-1);
-const candidates = [...uniqueModels.values()];
-const frequencies = new Map();
-for (const candidate of candidates) {
-	const tokens = new Set(tokenize(candidate.slice(candidate.indexOf("/") + 1)));
-	for (const token of tokens) frequencies.set(token, (frequencies.get(token) ?? 0) + 1);
+NODE
 }
+
+validate_model_id() {
+	local requested="$1" explicit="${2:-0}" suggestions rc catalog_available=0
+	if ensure_model_cache 0; then catalog_available=1; fi
+	suggestions=$(node - "$MODEL_CACHE" "$CUSTOM_MODELS" "$requested" "$catalog_available" <<'NODE'
+const fs = require("node:fs");
+const [cachePath, customPath, requested, rawCatalogAvailable] = process.argv.slice(2);
+const models = new Set();
+let baseCount = 0;
+if (rawCatalogAvailable === "1") {
+	try {
+		for (const line of fs.readFileSync(cachePath, "utf8").split("\n")) {
+			const [provider, model, ...rest] = line.split("\t");
+			if (!provider || !model || rest.length !== 0) continue;
+			models.add(`${provider}/${model}`);
+			baseCount += 1;
+		}
+	} catch {}
+}
+try {
+	const providers = JSON.parse(fs.readFileSync(customPath, "utf8")).providers;
+	if (providers && typeof providers === "object") {
+		for (const [provider, config] of Object.entries(providers)) {
+			if (!config || !Array.isArray(config.models)) continue;
+			for (const model of config.models) {
+				if (model && typeof model.id === "string" && model.id) models.add(`${provider}/${model.id}`);
+			}
+		}
+	}
+} catch {}
+if (models.has(requested)) process.exit(0);
+if (baseCount === 0) process.exit(2);
+
 function distance(left, right) {
 	let previous = Array.from({ length: right.length + 1 }, (_, index) => index);
 	for (let i = 1; i <= left.length; i += 1) {
@@ -531,18 +636,37 @@ function distance(left, right) {
 	}
 	return previous[right.length];
 }
-const ranked = candidates.map((candidate) => {
-	const separator = candidate.indexOf("/");
-	const provider = candidate.slice(0, separator);
-	const model = candidate.slice(separator + 1);
-	const tokens = new Set(tokenize(model));
-	let score = provider === requestedProvider ? 5 : 0;
-	for (const token of new Set(requestedTokens)) {
-		if (tokens.has(token)) score += Math.log((candidates.length + 1) / ((frequencies.get(token) ?? 0) + 1)) * 10;
+function longestCommonSubstring(left, right) {
+	let previous = new Array(right.length + 1).fill(0);
+	let longest = 0;
+	for (let i = 1; i <= left.length; i += 1) {
+		const current = new Array(right.length + 1).fill(0);
+		for (let j = 1; j <= right.length; j += 1) {
+			if (left[i - 1] === right[j - 1]) {
+				current[j] = previous[j - 1] + 1;
+				longest = Math.max(longest, current[j]);
+			}
+		}
+		previous = current;
 	}
-	if (lastToken && tokens.has(lastToken)) score += 100;
-	score -= (distance(requestedModel, model) / Math.max(requestedModel.length, model.length, 1)) * 10;
-	return { candidate, score };
+	return longest;
+}
+const separator = requested.indexOf("/");
+const requestedProvider = requested.slice(0, separator).toLowerCase();
+const requestedModel = requested.slice(separator + 1).toLowerCase();
+const ranked = [...models].flatMap((candidate) => {
+	const split = candidate.indexOf("/");
+	const provider = candidate.slice(0, split).toLowerCase();
+	const model = candidate.slice(split + 1).toLowerCase();
+	const editDistance = distance(requestedModel, model);
+	const commonLength = longestCommonSubstring(requestedModel, model);
+	const substring = requestedModel.includes(model) || model.includes(requestedModel);
+	if (!substring && editDistance > 3 && commonLength < 4) return [];
+	let score = commonLength * 12 - editDistance;
+	if (substring) score += 80;
+	if (editDistance <= 3) score += 120 - editDistance * 10;
+	if (provider === requestedProvider) score += 2;
+	return [{ candidate, score }];
 }).sort((left, right) => right.score - left.score || left.candidate.localeCompare(right.candidate));
 process.stdout.write(ranked.slice(0, 3).map(({ candidate }) => candidate).join(", "));
 process.exit(3);
@@ -551,17 +675,20 @@ NODE
 	case "$rc" in
 		0) return 0 ;;
 		2)
-			echo "subagents: warning: Pi model catalog unavailable within 850ms; skipping validation for '$requested'" >&2
+			if [ "$explicit" = 1 ]; then
+				die "could not validate explicit model '$requested' because Pi's model catalog is unavailable. Run 'subagents models --refresh' and try again"
+			fi
+			echo "subagents: warning: Pi model catalog unavailable; continuing with inherited model '$requested'. Run 'subagents models --refresh' to retry validation" >&2
 			return 0
 			;;
 		3) die "model '$requested' was not found in Pi's model catalog. Closest matches: ${suggestions:-none}" ;;
 		*)
-			echo "subagents: warning: Pi model catalog validation failed; skipping validation for '$requested'" >&2
+			if [ "$explicit" = 1 ]; then die "validation failed for explicit model '$requested'; run 'subagents models --refresh' and try again"; fi
+			echo "subagents: warning: Pi model catalog validation failed; continuing with inherited model '$requested'" >&2
 			return 0
 			;;
 	esac
 }
-
 # ---- immutable snapshots and durable completion spool --------------------
 
 snapshot() {
@@ -850,6 +977,20 @@ cmd_config() {
 	printf 'package_version=%s\n' "$PACKAGE_VERSION"
 }
 
+cmd_models() {
+	local force=0
+	case "${1:-}" in
+		"") ;;
+		--refresh) force=1; shift ;;
+		*) die "usage: subagents models [--refresh]" ;;
+	esac
+	[ "$#" = 0 ] || die "usage: subagents models [--refresh]"
+	if ! ensure_model_cache "$force"; then
+		die "Pi model catalog is unavailable; run 'subagents models --refresh' to retry"
+	fi
+	print_model_catalog || die "Pi model catalog cache is empty or invalid; run 'subagents models --refresh' to rebuild it"
+}
+
 cmd_doctor() {
 	local failures=0 warnings=0 orphan_sessions=0 root count dir name pane pane_session launcher_bin session_id
 	local lock_path lock_label event_file
@@ -910,7 +1051,7 @@ cmd_doctor() {
 cmd_run() {
 	local model_override="" effort_override="" task session_id id dir result temporary protocol pane picmd
 	local inherited_provider="${PI_PROVIDER:-}" inherited_model="${PI_MODEL:-}" inherited_effort="${PI_REASONING_LEVEL:-}"
-	local launch_model="" launch_effort="" launch_provider="" launch_model_id="" q_pwd q_proto q_task q_model q_effort q_provider q_model_id q_ready
+	local launch_model="" launch_effort="" launch_provider="" launch_model_id="" model_explicit=0 q_pwd q_proto q_task q_model q_effort q_provider q_model_id q_ready
 	while [ $# -gt 0 ]; do
 		case "$1" in
 			-m|--model) [ $# -ge 2 ] && [ -n "$2" ] || die "$1 needs a value"; model_override="$2"; shift 2 ;;
@@ -937,11 +1078,12 @@ cmd_run() {
 		fi
 	else
 		launch_model="$model_override"
+		model_explicit=1
 	fi
 	[ -z "$effort_override" ] || launch_effort="$effort_override"
 	if [ -n "$launch_model" ]; then
 		launch_provider=${launch_model%%/*}; launch_model_id=${launch_model#*/}
-		validate_model_id "$launch_model"
+		validate_model_id "$launch_model" "$model_explicit"
 	fi
 
 	session_id=$(current_session_id)
@@ -1249,6 +1391,8 @@ cmd="${1:-}"; shift || true
 case "$cmd" in
 	protocol) cmd_protocol "$@" ;;
 	config) cmd_config "$@" ;;
+	models) cmd_models "$@" ;;
+	_refresh-model-cache) refresh_model_cache ;;
 	""|-h|--help|help) usage ;;
 	doctor|run|publish|tell|retain|release|wait|events|reap|status|peek|ls|cleanup|stop|purge|ack)
 		prepare_session_state

@@ -7,10 +7,19 @@ TMP=$(mktemp -d "${TMPDIR:-/tmp}/pi-subagents-cli.XXXXXX")
 SOCKET="pi-subagents-test-$$"
 trap 'tmux -L "$SOCKET" kill-server 2>/dev/null || true; rm -rf "$TMP"' EXIT
 
-mkdir -p "$TMP/home" "$TMP/state" "$TMP/bin"
+mkdir -p "$TMP/home/.pi/agent" "$TMP/state" "$TMP/bin"
+cat >"$TMP/home/.pi/agent/models.json" <<'MODELS_JSON'
+{
+  "providers": {
+    "custom-provider": {
+      "models": [{ "id": "custom-model" }]
+    }
+  }
+}
+MODELS_JSON
 ln -s "$ROOT/skills/subagents" "$TMP/linked-skill"
 LINKED_PROTOCOL=$(HOME="$TMP/home" "$TMP/linked-skill/subagents" protocol)
-node -e 'const p=JSON.parse(process.argv[1]); if(p.packageVersion!=="0.3.1")process.exit(1)' "$LINKED_PROTOCOL"
+node -e 'const p=JSON.parse(process.argv[1]); if(p.packageVersion!=="0.3.2")process.exit(1)' "$LINKED_PROTOCOL"
 cat >"$TMP/bin/auth-wrapper" <<'WRAPPER'
 #!/bin/sh
 exec "$@"
@@ -25,13 +34,14 @@ grep -Fqx 'window_name=helpers' <<<"$CONFIG"
 grep -Fqx 'cleanup_mode=on' <<<"$CONFIG"
 grep -Fqx 'cleanup_grace_seconds=600' <<<"$CONFIG"
 grep -Fqx 'protocol_id=pi-subagents' <<<"$CONFIG"
-grep -Fqx 'package_version=0.3.1' <<<"$CONFIG"
+grep -Fqx 'package_version=0.3.2' <<<"$CONFIG"
 [ "$(wc -l <<<"$CONFIG" | tr -d ' ')" = 7 ]
 
 PROTOCOL=$(HOME="$TMP/home" "$CLI" protocol)
-node -e 'const p=JSON.parse(process.argv[1]); if(p.protocolId!=="pi-subagents"||p.packageVersion!=="0.3.1"||p.watcherApiVersion!==1)process.exit(1)' "$PROTOCOL"
+node -e 'const p=JSON.parse(process.argv[1]); if(p.protocolId!=="pi-subagents"||p.packageVersion!=="0.3.2"||p.watcherApiVersion!==1)process.exit(1)' "$PROTOCOL"
 HELP=$(HOME="$TMP/home" "$CLI" --help)
 grep -Fq 'subagents run [-m MODEL] [--effort LEVEL] <task...>' <<<"$HELP"
+grep -Fq 'subagents models [--refresh]' <<<"$HELP"
 grep -Fq 'subagents retain <id>' <<<"$HELP"
 grep -Fq 'subagents purge <id|--all>' <<<"$HELP"
 for removed_alias in list kill; do
@@ -47,17 +57,24 @@ if env -u TMUX -u TMUX_PANE HOME="$TMP/home" SUBAGENTS_STATE_DIR="$TMP/state" "$
 fi
 grep -Fq 'subagents requires tmux' "$TMP/err"
 
+cat >"$TMP/bin/pi" <<FAKE_CATALOG
+#!/bin/sh
+printf '%s\n' direct >>"$TMP/catalog-calls"
+[ "\${FAKE_PI_CATALOG_UNAVAILABLE:-}" != 1 ] || exit 2
+printf '%s\n' \
+	'provider model context max-out thinking images' \
+	'lead-provider lead-model 1M 128K yes yes' \
+	'example-provider example-model 1M 128K yes yes' \
+	'example-provider no-effort 1M 128K yes yes' \
+	'anthropic claude-fable-5-1 1M 128K yes yes'
+FAKE_CATALOG
+chmod +x "$TMP/bin/pi"
+
 cat >"$TMP/bin/fake-pi" <<FAKE_PI
 #!/bin/sh
 if [ "\${1:-}" = "--list-models" ]; then
-	[ "\${FAKE_PI_CATALOG_UNAVAILABLE:-}" != 1 ] || exit 2
-	printf '%s\n' \
-		'provider model context max-out thinking images' \
-		'lead-provider lead-model 1M 128K yes yes' \
-		'example-provider example-model 1M 128K yes yes' \
-		'example-provider no-effort 1M 128K yes yes' \
-		'anthropic claude-fable-5-1 1M 128K yes yes'
-	exit 0
+	printf '%s\n' launcher >>"$TMP/catalog-calls"
+	exit 2
 fi
 last=""
 protocol=""
@@ -90,10 +107,35 @@ sleep 30
 FAKE_PI
 chmod +x "$TMP/bin/fake-pi"
 
+MODELS=$(PATH="$TMP/bin:$PATH" HOME="$TMP/home" XDG_CACHE_HOME="$TMP/cache" SUBAGENTS_PI="$TMP/bin/fake-pi" "$CLI" models --refresh)
+grep -Fqx $'provider\tmodel' <<<"$MODELS"
+grep -Fqx $'anthropic\tclaude-fable-5-1' <<<"$MODELS"
+grep -Fqx $'custom-provider\tcustom-model' <<<"$MODELS"
+grep -Fqx direct "$TMP/catalog-calls"
+if grep -Fqx launcher "$TMP/catalog-calls"; then echo 'launcher wrapper was used despite pi on PATH' >&2; exit 1; fi
+CACHED_MODELS=$(PATH="$TMP/bin:$PATH" HOME="$TMP/home" XDG_CACHE_HOME="$TMP/cache" FAKE_PI_CATALOG_UNAVAILABLE=1 "$CLI" models)
+grep -Fqx $'anthropic\tclaude-fable-5-1' <<<"$CACHED_MODELS"
+
+mkdir -p "$TMP/no-pi-bin"
+for dependency in bash node dirname stat date; do ln -s "$(command -v "$dependency")" "$TMP/no-pi-bin/$dependency"; done
+cat >"$TMP/bin/fallback-pi" <<FAKE_FALLBACK
+#!/bin/sh
+printf '%s\n' fallback >"$TMP/fallback-call"
+printf '%s\n' \
+	'provider model context max-out thinking images' \
+	'fallback-provider fallback-model 1M 128K yes yes'
+FAKE_FALLBACK
+chmod +x "$TMP/bin/fallback-pi"
+FALLBACK_MODELS=$(PATH="$TMP/no-pi-bin" HOME="$TMP/home" XDG_CACHE_HOME="$TMP/fallback-cache" SUBAGENTS_PI="$TMP/bin/fallback-pi" "$CLI" models --refresh)
+grep -Fqx $'fallback-provider\tfallback-model' <<<"$FALLBACK_MODELS"
+grep -Fqx fallback "$TMP/fallback-call"
+
 cat >"$TMP/tmux-smoke" <<TMUX_SMOKE
 #!/bin/sh
 set -eu
 export HOME="$TMP/home"
+export PATH="$TMP/bin:$PATH"
+export XDG_CACHE_HOME="$TMP/cache"
 export SUBAGENTS_STATE_DIR="$TMP/state"
 export SUBAGENTS_PI="$TMP/bin/fake-pi"
 export SUBAGENTS_WINDOW_NAME=helpers
@@ -109,7 +151,12 @@ if "$CLI" run -m openai/gpt-5.6-fable "unknown qualified model" >"$TMP/run-unkno
 "$CLI" doctor >"$TMP/doctor.out" 2>"$TMP/doctor.err"
 if SUBAGENTS_PI="$TMP/bin/missing-pi" "$CLI" run "launcher failure must be surfaced" >"$TMP/run-launch-fail.out" 2>"$TMP/run-launch-fail.err"; then exit 1; fi
 grep -Fq 'doctor preflight failed: launcher command not found' "$TMP/run-launch-fail.err"
-FAKE_PI_CATALOG_UNAVAILABLE=1 "$CLI" run "Catalog unavailable warning-smoke" >"$TMP/run-catalog-warning.out" 2>"$TMP/run-catalog-warning.err"
+panes_before=\$(tmux list-panes -a -F '#{pane_id}' | wc -l | tr -d ' ')
+if XDG_CACHE_HOME="$TMP/unavailable-explicit-cache" FAKE_PI_CATALOG_UNAVAILABLE=1 "$CLI" run -m openai/gpt-5.6-fable "must reject without a catalog" >"$TMP/run-catalog-explicit.out" 2>"$TMP/run-catalog-explicit.err"; then exit 1; fi
+panes_after=\$(tmux list-panes -a -F '#{pane_id}' | wc -l | tr -d ' ')
+[ "\$panes_before" = "\$panes_after" ]
+XDG_CACHE_HOME="$TMP/unavailable-custom-cache" FAKE_PI_CATALOG_UNAVAILABLE=1 "$CLI" run -m custom-provider/custom-model "custom model smoke" >"$TMP/run-custom-model.out" 2>"$TMP/run-custom-model.err"
+XDG_CACHE_HOME="$TMP/unavailable-inherited-cache" FAKE_PI_CATALOG_UNAVAILABLE=1 "$CLI" run "Catalog unavailable warning-smoke" >"$TMP/run-catalog-warning.out" 2>"$TMP/run-catalog-warning.err"
 "$CLI" wait 1 10 >"$TMP/wait.out" 2>"$TMP/wait.err"
 "$CLI" events >"$TMP/events.out" 2>"$TMP/events.err"
 "$CLI" reap >"$TMP/reap.out" 2>"$TMP/reap.err"
@@ -124,6 +171,7 @@ FAKE_PI_CATALOG_UNAVAILABLE=1 "$CLI" run "Catalog unavailable warning-smoke" >"$
 "$CLI" stop 1 >"$TMP/stop1.out" 2>"$TMP/stop1.err"
 "$CLI" stop 3 >"$TMP/stop3.out" 2>"$TMP/stop3.err"
 "$CLI" stop 4 >"$TMP/stop4.out" 2>"$TMP/stop4.err"
+"$CLI" stop 5 >"$TMP/stop5.out" 2>"$TMP/stop5.err"
 echo 0 >"$TMP/run.rc"
 TMUX_SMOKE
 chmod +x "$TMP/tmux-smoke"
@@ -146,8 +194,11 @@ grep -Fq "model 'unqualified' is not provider-qualified" "$TMP/run-invalid.err"
 grep -Fq "model 'openai/gpt-5.6-fable' was not found in Pi's model catalog" "$TMP/run-unknown-model.err"
 grep -Fq 'Closest matches: anthropic/claude-fable-5-1' "$TMP/run-unknown-model.err"
 grep -Fq 'doctor preflight failed: launcher command not found' "$TMP/run-launch-fail.err"
-grep -Fq 'Pi model catalog unavailable within 850ms; skipping validation' "$TMP/run-catalog-warning.err"
-grep -Fq 'started subagent #4' "$TMP/run-catalog-warning.out"
+grep -Fq "could not validate explicit model 'openai/gpt-5.6-fable' because Pi's model catalog is unavailable" "$TMP/run-catalog-explicit.err"
+grep -Fq "subagents models --refresh" "$TMP/run-catalog-explicit.err"
+grep -Fq "Pi model catalog unavailable; continuing with inherited model 'lead-provider/lead-model'" "$TMP/run-catalog-warning.err"
+grep -Fq 'model custom-provider/custom-model' "$TMP/run-custom-model.out"
+grep -Fq 'started subagent #5' "$TMP/run-catalog-warning.out"
 grep -Fqx 'doctor: healthy' "$TMP/doctor.out"
 grep -Fq '=== subagent #1 report (done) ===' "$TMP/wait.out"
 grep -Fq 'completed report for Inspect' "$TMP/wait.out"
@@ -182,7 +233,7 @@ ARCHIVED_EVENT=$(find "$TMP/state" -type f -path '*/1/events/*.json' -print -qui
 node - "$ARCHIVED_EVENT" <<'NODE'
 const fs = require("node:fs");
 const event = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
-if (event.protocolId !== "pi-subagents" || event.packageVersion !== "0.3.1" || event.schemaVersion !== 1) process.exit(1);
+if (event.protocolId !== "pi-subagents" || event.packageVersion !== "0.3.2" || event.schemaVersion !== 1) process.exit(1);
 if (event.id !== "1" || event.generation !== 1 || event.status !== "done" || event.outcome !== "completed") process.exit(1);
 if (!event.reportBody.includes("completed report")) process.exit(1);
 NODE

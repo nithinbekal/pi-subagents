@@ -25,7 +25,7 @@ machine-generated state. The spawning agent supplies each complete task brief.
 - a local state filesystem with atomic rename, hard links, and `fsync`
 - standard Unix tools including `awk`, `cksum`, `grep`, `ps`, and `tail`
 
-Version 0.3.1 supports only its current versioned state and event formats. It
+Version 0.3.2 supports only its current versioned state and event formats. It
 does not read, migrate, or silently brand legacy package state. The package
 manifest, `protocol.json`, CLI constants, state helper, watcher handshake,
 session state marker, lifecycle records, and completion events identify their
@@ -63,6 +63,7 @@ same state directory and package version.
 | --- | --- | --- | --- |
 | `SUBAGENTS_STATE_DIR` | CLI, watcher | `${XDG_STATE_HOME:-$HOME/.local/state}/subagents` | Exact state root. |
 | `XDG_STATE_HOME` | CLI, watcher | `$HOME/.local/state` | Base when `SUBAGENTS_STATE_DIR` is unset. |
+| `XDG_CACHE_HOME` | CLI | `$HOME/.cache` | Base for the 24-hour Pi model catalog cache. |
 | `SUBAGENTS_PI` | CLI | `pi` | Trusted worker launcher command, optionally an authentication wrapper followed by `pi`. |
 | `SUBAGENTS_BIN` | watcher | package-local CLI | Explicit executable used for protocol handshake, events, cleanup, and acknowledgements. |
 | `SUBAGENTS_WINDOW_NAME` | CLI | `subagents` | tmux window name/prefix. |
@@ -127,15 +128,27 @@ subagents run --model openai/gpt-5.4 --effort high "<complete brief>"
 
 A model override must be provider-qualified. Before launch, `run` performs a
 lightweight doctor preflight and checks the selected model against Pi's local
-model catalog. An unknown model fails with close matches. If the catalog cannot
-be read within 850 ms, validation warns and launch continues. `--effort` accepts
-Pi's supported levels. An explicit model without `--effort` does not inherit the
-old model's reasoning level. An explicit effort overrides inherited reasoning.
+model catalog. It invokes `pi --list-models` directly when `pi` is on `PATH`,
+falling back to the configured launcher only when it is not, and allows up to
+five seconds to rebuild the catalog. Parsed provider/model ids are cached for 24
+hours at `${XDG_CACHE_HOME:-$HOME/.cache}/pi-subagents/models.tsv`; a fresh cache
+is used immediately and refreshed in a detached background process. Explicit
+model ids from `~/.pi/agent/models.json` are merged into the accepted set because
+custom providers are valid worker targets.
+
+Use `subagents models` to print the effective catalog or `subagents models
+--refresh` to synchronously rebuild the cache. Unknown models fail with fuzzy
+model-id matches across providers. If no catalog is available, an explicit `-m`
+fails before pane creation and points to `models --refresh`; an inherited model
+warns and continues. `--effort` accepts Pi's supported levels. An explicit model
+without `--effort` does not inherit the old model's reasoning level. An explicit
+effort overrides inherited reasoning.
 
 ## CLI workflow
 
 ```bash
 subagents doctor
+subagents models --refresh
 subagents run "Make the requested change, verify it, and report the result"
 subagents status
 subagents retain 1

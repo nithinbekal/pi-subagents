@@ -6,7 +6,7 @@ import { fileURLToPath } from "node:url";
 export type SubagentsEnvironment = NodeJS.ProcessEnv;
 
 export const PROTOCOL_ID = "pi-subagents";
-export const PACKAGE_VERSION = "0.3.1";
+export const PACKAGE_VERSION = "0.3.2";
 export const CLI_API_VERSION = 1;
 export const WATCHER_API_VERSION = 1;
 export const STATE_SCHEMA_VERSION = 1;

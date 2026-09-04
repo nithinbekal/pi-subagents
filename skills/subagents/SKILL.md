@@ -24,8 +24,11 @@ file and invoke it by absolute path; examples use `subagents` for readability.
    `PI_PROVIDER`, `PI_MODEL`, and `PI_REASONING_LEVEL`; the CLI carries those
    values explicitly through tmux. Use `-m provider/model` or `--effort LEVEL`
    only for a deliberate override. `run` performs a lightweight doctor preflight
-   and rejects unknown models with close matches. If Pi's catalog is unavailable
-   within 850 ms, it warns and continues.
+   and rejects unknown models with fuzzy matches across providers. Catalog ids
+   come from direct `pi --list-models` output plus custom ids in
+   `~/.pi/agent/models.json` and are cached for 24 hours. If validation is
+   unavailable, explicit `-m` fails before creating a pane; inherited selection
+   warns and continues. Use `subagents models --refresh` to rebuild the cache.
 
 ## Commands
 
@@ -33,6 +36,7 @@ file and invoke it by absolute path; examples use `subagents` for readability.
 subagents protocol
 subagents config
 subagents doctor
+subagents models [--refresh]
 subagents run [-m provider/model] [--effort LEVEL] "<complete task brief>"
 subagents tell <id> "<follow-up>"
 subagents retain <id>

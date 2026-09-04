@@ -654,7 +654,16 @@ function longestCommonSubstring(left, right) {
 const separator = requested.indexOf("/");
 const requestedProvider = requested.slice(0, separator).toLowerCase();
 const requestedModel = requested.slice(separator + 1).toLowerCase();
-const ranked = [...models].flatMap((candidate) => {
+const tokenize = (value) => value.match(/[a-z0-9]+/g) ?? [];
+const requestedLastToken = tokenize(requestedModel).at(-1);
+const suggestionModels = new Map();
+for (const candidate of models) {
+	const split = candidate.indexOf("/");
+	const model = candidate.slice(split + 1);
+	const previous = suggestionModels.get(model);
+	if (!previous || split < previous.indexOf("/")) suggestionModels.set(model, candidate);
+}
+const ranked = [...suggestionModels.values()].flatMap((candidate) => {
 	const split = candidate.indexOf("/");
 	const provider = candidate.slice(0, split).toLowerCase();
 	const model = candidate.slice(split + 1).toLowerCase();
@@ -665,6 +674,7 @@ const ranked = [...models].flatMap((candidate) => {
 	let score = commonLength * 12 - editDistance;
 	if (substring) score += 80;
 	if (editDistance <= 3) score += 120 - editDistance * 10;
+	if (requestedLastToken && requestedLastToken.length >= 4 && tokenize(model).includes(requestedLastToken)) score += 250;
 	if (provider === requestedProvider) score += 2;
 	return [{ candidate, score }];
 }).sort((left, right) => right.score - left.score || left.candidate.localeCompare(right.candidate));

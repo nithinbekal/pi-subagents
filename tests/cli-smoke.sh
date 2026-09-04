@@ -66,6 +66,8 @@ printf '%s\n' \
 	'lead-provider lead-model 1M 128K yes yes' \
 	'example-provider example-model 1M 128K yes yes' \
 	'example-provider no-effort 1M 128K yes yes' \
+	'openai gpt-5 1M 128K yes yes' \
+	'openai gpt-5.6-sol 1M 128K yes yes' \
 	'anthropic claude-fable-5-1 1M 128K yes yes'
 FAKE_CATALOG
 chmod +x "$TMP/bin/pi"

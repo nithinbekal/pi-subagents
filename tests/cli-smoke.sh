@@ -8,6 +8,9 @@ SOCKET="pi-subagents-test-$$"
 trap 'tmux -L "$SOCKET" kill-server 2>/dev/null || true; rm -rf "$TMP"' EXIT
 
 mkdir -p "$TMP/home" "$TMP/state" "$TMP/bin"
+ln -s "$ROOT/skills/subagents" "$TMP/linked-skill"
+LINKED_PROTOCOL=$(HOME="$TMP/home" "$TMP/linked-skill/subagents" protocol)
+node -e 'const p=JSON.parse(process.argv[1]); if(p.packageVersion!=="0.3.1")process.exit(1)' "$LINKED_PROTOCOL"
 cat >"$TMP/bin/auth-wrapper" <<'WRAPPER'
 #!/bin/sh
 exec "$@"

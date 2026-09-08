@@ -184,6 +184,90 @@ esac
 	}
 });
 
+test("watcher reports subprocess facts for events and acknowledgement failures", async (t) => {
+	const failures = [
+		{ name: "silent exit", script: "exit 17", code: "17", signal: "null", killed: "false" },
+		{ name: "TERM-trapped deadline", script: "trap 'exit 19' TERM; while :; do sleep 0.05; done", code: "19", signal: "null", killed: "true" },
+		{ name: "external signal", script: 'kill -TERM "$$"', code: "null", signal: "SIGTERM", killed: "false" },
+		{ name: "stderr", script: "printf '%s\\n' 'specific child failure' >&2; exit 23", code: "23", signal: "null", killed: "false" },
+	];
+	for (const command of ["events", "ack"]) {
+		for (const failure of failures) {
+			await t.test(`${command}: ${failure.name}`, { timeout: 25_000 }, async () => {
+				const root = await mkdtemp(path.join(tmpdir(), "pi-subagents-command-failure-"));
+				const stateDir = path.join(root, "state");
+				const sessionDir = path.join(stateDir, "$9");
+				const pendingDir = path.join(sessionDir, ".watcher-pending");
+				const report = path.join(sessionDir, "7", "reports", "1.md");
+				const queuedPath = path.join(pendingDir, "7-1-event.json");
+				const sessionFile = path.join(root, "session.jsonl");
+				const bin = path.join(root, "subagents");
+				const completionKey = "7:done:1:123:16";
+				const id = eventId("7", 1, "done", completionKey);
+				await mkdir(path.dirname(report), { recursive: true });
+				await mkdir(pendingDir, { recursive: true });
+				await writeFile(path.join(sessionDir, ".schema.json"), JSON.stringify(EXPECTED_PACKAGE_CONTRACT));
+				await writeFile(report, "complete report\n");
+				await writeFile(sessionFile, command === "ack"
+					? `${JSON.stringify({ type: "custom_message", customType: "subagent-report", details: { eventId: id } })}\n`
+					: "");
+				const queuedContents = JSON.stringify({
+					protocolId: PROTOCOL_ID, packageVersion: EXPECTED_PACKAGE_CONTRACT.packageVersion,
+					schemaVersion: EVENT_SCHEMA_VERSION, id: "7", generation: 1, status: "done", outcome: "completed",
+					completionKey, eventId: id, reportPath: report, reportBody: "complete report\n", createdAt: 1,
+				});
+				if (command === "ack") await writeFile(queuedPath, queuedContents);
+				await writeFile(bin, `#!/bin/sh
+case "$1" in
+  protocol) printf '%s\\n' '${JSON.stringify(EXPECTED_PACKAGE_CONTRACT)}' ;;
+  ${command}) ${failure.script} ;;
+  *) exit 0 ;;
+esac
+`, { mode: 0o755 });
+				const previous = saveEnv(["SUBAGENTS_BIN", "SUBAGENTS_STATE_DIR", "SUBAGENTS_WATCH_MS", "TMUX", "TMUX_PANE"]);
+				process.env.SUBAGENTS_BIN = bin;
+				process.env.SUBAGENTS_STATE_DIR = stateDir;
+				process.env.SUBAGENTS_WATCH_MS = "60000";
+				process.env.TMUX = "/tmp/fake-tmux,123,9";
+				delete process.env.TMUX_PANE;
+				const handlers = new Map<string, Function>();
+				let notify: (message: string) => void = () => {};
+				let deadline: ReturnType<typeof setTimeout> | undefined;
+				const diagnostic = new Promise<string>((resolve, reject) => {
+					notify = resolve;
+					deadline = setTimeout(() => reject(new Error("missing subprocess failure diagnostic")), 20_000);
+				});
+				try {
+					subagentsWatch({
+						on(name: string, handler: Function) { handlers.set(name, handler); },
+						sendMessage() { assert.fail("an already persisted report must not be resent"); },
+					} as never);
+					handlers.get("session_start")?.({}, {
+						hasUI: true, sessionManager: { getSessionFile: () => sessionFile }, ui: { notify },
+					});
+					const message = await diagnostic;
+					assert.match(message, command === "events" ? /event detection or cleanup failed/ : /acknowledgement failed/);
+					assert.match(message, new RegExp(`code=${failure.code}, signal=${failure.signal}, killed=${failure.killed}`));
+					assert.match(message, /elapsed=\d+ms, budget=10000ms/);
+					assert.doesNotMatch(message, /timed out|timeout confirmed/i);
+					if (failure.name === "stderr") assert.match(message, /specific child failure/);
+					if (failure.name === "TERM-trapped deadline") {
+						assert.ok(Number(message.match(/elapsed=(\d+)ms/)?.[1]) >= 10_000);
+					}
+					if (command === "ack") {
+						assert.equal(await readFile(queuedPath, "utf8"), queuedContents);
+						await assert.rejects(access(path.join(sessionDir, ".watcher-delivered", id)));
+					}
+				} finally {
+					if (deadline) clearTimeout(deadline);
+					await handlers.get("session_shutdown")?.();
+					restoreEnv(previous);
+				}
+			});
+		}
+	}
+});
+
 test("watcher preserves malformed spool records instead of mixing or deleting them", async () => {
 	const root = await mkdtemp(path.join(tmpdir(), "pi-subagents-malformed-event-"));
 	const stateDir = path.join(root, "state");

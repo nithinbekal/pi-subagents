@@ -171,30 +171,45 @@ if grep -Fq 'Lifecycle protection case' "$TMP/status-unknown.out"; then echo 'st
 mv "\$root/9/lifecycle.saved" "\$root/9/lifecycle.json"
 mv "\$root/10/lifecycle.saved" "\$root/10/lifecycle.json"
 
-# A pending record quarantined as .json.corrupt by an older watcher is restored
-# when it still matches the lifecycle and report; a mismatched one stays protected.
+# Lookup and dry-run preserve quarantined records, even if their contents are
+# valid. Missing pending/archive evidence still protects the worker.
 launch 11
 publish 11 completed
 spool11=\$(node -e 'console.log(JSON.parse(require("fs").readFileSync(process.argv[1])).spoolName)' "\$root/11/lifecycle.json")
 mv "\$root/.watcher-pending/\$spool11.json" "\$root/.watcher-pending/\$spool11.json.corrupt"
-SUBAGENTS_CLEANUP_MODE=notify SUBAGENTS_CLEANUP_GRACE_SECONDS=0 "$CLI" cleanup >"$TMP/cleanup-quarantine.out" 2>"$TMP/cleanup-quarantine.err"
-grep -Fq 'subagent #11 is eligible for cleanup (notify mode; no pane stopped)' "$TMP/cleanup-quarantine.out"
-[ -f "\$root/.watcher-pending/\$spool11.json" ]
-[ ! -e "\$root/.watcher-pending/\$spool11.json.corrupt" ]
+cp "\$root/.watcher-pending/\$spool11.json.corrupt" "$TMP/quarantine.saved"
+cp "\$root/11/lifecycle.json" "$TMP/lifecycle-quarantine.saved"
+if node "$ROOT/skills/subagents/state.mjs" pending "\$root/11/lifecycle.json" "\$root" >"$TMP/pending-quarantine.out" 2>"$TMP/pending-quarantine.err"; then
+	echo 'lookup unexpectedly restored a quarantined event' >&2
+	exit 1
+fi
+[ ! -s "$TMP/pending-quarantine.out" ]
+if SUBAGENTS_CLEANUP_MODE=dry-run SUBAGENTS_CLEANUP_GRACE_SECONDS=0 "$CLI" cleanup >"$TMP/cleanup-quarantine.out" 2>"$TMP/cleanup-quarantine.err"; then
+	echo 'dry-run unexpectedly accepted a quarantined event as pending' >&2
+	exit 1
+fi
+grep -Fq 'subagent #11 has invalid lifecycle or delivery state; protected' "$TMP/cleanup-quarantine.out"
+cmp "$TMP/quarantine.saved" "\$root/.watcher-pending/\$spool11.json.corrupt"
+cmp "$TMP/lifecycle-quarantine.saved" "\$root/11/lifecycle.json"
+[ ! -e "\$root/.watcher-pending/\$spool11.json" ]
+pane_alive_for 11
 "$CLI" retain 11 >/dev/null
+
+# Stale quarantine files cannot mask a valid archive and delivery marker.
 launch 12
 publish 12 completed
 spool12=\$(node -e 'console.log(JSON.parse(require("fs").readFileSync(process.argv[1])).spoolName)' "\$root/12/lifecycle.json")
-mv "\$root/.watcher-pending/\$spool12.json" "\$root/.watcher-pending/\$spool12.json.corrupt"
-printf 'tampered\n' >>"\$root/12/reports/1.md"
-if SUBAGENTS_CLEANUP_MODE=notify SUBAGENTS_CLEANUP_GRACE_SECONDS=0 "$CLI" cleanup >"$TMP/cleanup-quarantine-bad.out" 2>"$TMP/cleanup-quarantine-bad.err"; then
-	echo 'cleanup unexpectedly restored a mismatched quarantined event' >&2
-	exit 1
-fi
-grep -Fq 'subagent #12 has invalid lifecycle or delivery state; protected' "$TMP/cleanup-quarantine-bad.out"
-[ -f "\$root/.watcher-pending/\$spool12.json.corrupt" ]
+ack_worker 12
+printf '{malformed\n' >"\$root/.watcher-pending/\$spool12.json.corrupt"
+cp "\$root/.watcher-pending/\$spool12.json.corrupt" "$TMP/quarantine-archive.saved"
+cp "\$root/12/lifecycle.json" "$TMP/lifecycle-archive.saved"
+SUBAGENTS_CLEANUP_MODE=dry-run SUBAGENTS_CLEANUP_GRACE_SECONDS=0 "$CLI" cleanup >"$TMP/cleanup-quarantine-archive.out" 2>"$TMP/cleanup-quarantine-archive.err"
+grep -Fq 'would stop subagent #12' "$TMP/cleanup-quarantine-archive.out"
+cmp "$TMP/quarantine-archive.saved" "\$root/.watcher-pending/\$spool12.json.corrupt"
+cmp "$TMP/lifecycle-archive.saved" "\$root/12/lifecycle.json"
 [ ! -e "\$root/.watcher-pending/\$spool12.json" ]
 pane_alive_for 12
+"$CLI" retain 12 >/dev/null
 
 # Session schema mismatch and unversioned legacy-looking roots fail loudly
 # before any worker or spool state is consumed.

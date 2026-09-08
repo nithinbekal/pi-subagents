@@ -18,7 +18,7 @@
  */
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { execFile, execFileSync } from "node:child_process";
+import { execFile, execFileSync, type ExecFileException } from "node:child_process";
 import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -35,6 +35,7 @@ import {
 
 const PREVIEW_CHARS = 1500;
 const DEFAULT_WATCH_MS = 3000;
+const COMMAND_TIMEOUT_MS = 10_000;
 const DELIVERY_RETRY_MS = 30 * 60_000;
 
 const EVENT_KEYS = [
@@ -203,13 +204,23 @@ export default function subagentsWatch(pi: ExtensionAPI) {
 	const ackPromises = new Map<string, Promise<void>>();
 	const reportedErrors = new Set<string>();
 
-	const reportError = (operation: string, error: unknown): void => {
+	const reportError = (operation: string, error: unknown, details?: string): void => {
 		const message = error instanceof Error ? error.message : String(error);
 		const key = `${operation}: ${message}`;
 		if (reportedErrors.has(key)) return;
 		reportedErrors.add(key);
-		console.error(`[subagents-watch] ${key}`);
-		if (context?.hasUI) context.ui.notify(`subagents watcher: ${key}`, "error");
+		const diagnostic = details ? `${key} [${details}]` : key;
+		console.error(`[subagents-watch] ${diagnostic}`);
+		if (context?.hasUI) context.ui.notify(`subagents watcher: ${diagnostic}`, "error");
+	};
+
+	const reportCommandError = (operation: string, error: ExecFileException, stderr: string, startedAt: number): void => {
+		const message = stderr.trim() || error.message.trimEnd();
+		const facts = `code=${String(error.code)}, signal=${String(error.signal)}, killed=${String(error.killed)}`;
+		// Elapsed time is diagnostic only, not part of the recurring-error key.
+		// A killed child alone does not prove that its timeout fired.
+		reportError(operation, `${message} (${facts})`,
+			`elapsed=${Math.round(performance.now() - startedAt)}ms, budget=${COMMAND_TIMEOUT_MS}ms`);
 	};
 
 	const hasSubagents = (): boolean => {
@@ -294,12 +305,13 @@ export default function subagentsWatch(pi: ExtensionAPI) {
 	const requestAck = (event: CompletionEvent, queuedPath: string): void => {
 		if (ackPromises.has(event.eventId)) return;
 		const promise = new Promise<void>((resolve) => {
+			const startedAt = performance.now();
 			execFile(
 				bin,
 				["ack", event.id, event.eventId, path.basename(queuedPath)],
-				{ encoding: "utf8", timeout: 10_000, env: process.env },
+				{ encoding: "utf8", timeout: COMMAND_TIMEOUT_MS, env: process.env },
 				(error, _stdout, stderr) => {
-					if (error) reportError(`acknowledgement failed for event ${event.eventId}`, stderr.trim() || error);
+					if (error) reportCommandError(`acknowledgement failed for event ${event.eventId}`, error, stderr, startedAt);
 					else {
 						deliveryAttempts.delete(event.eventId);
 						queuedEvents.delete(event.eventId);
@@ -447,9 +459,10 @@ export default function subagentsWatch(pi: ExtensionAPI) {
 		draining = true;
 		drainPromise = new Promise<void>((resolve) => { finishDrain = resolve; });
 		try {
-			execFile(bin, ["events"], { encoding: "utf8", timeout: 10_000, env: process.env }, (error, _stdout, stderr) => {
+			const startedAt = performance.now();
+			execFile(bin, ["events"], { encoding: "utf8", timeout: COMMAND_TIMEOUT_MS, env: process.env }, (error, _stdout, stderr) => {
 				try {
-					if (error) reportError("event detection or cleanup failed", stderr.trim() || error);
+					if (error) reportCommandError("event detection or cleanup failed", error, stderr, startedAt);
 					else if (stderr.trim()) console.error(`[subagents-watch] ${stderr.trim()}`);
 					if (stateContractReady()) {
 						reconcilePersistedDeliveries();

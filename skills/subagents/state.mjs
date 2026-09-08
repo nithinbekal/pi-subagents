@@ -369,6 +369,30 @@ function validateEventReport(event, sessionRoot) {
 	if (body !== event.reportBody) throw new Error("event report snapshot no longer matches its durable record");
 }
 
+// Older watchers renamed a queued event to `<name>.json.corrupt[.<uuid>]` when a
+// transient read failed. The lifecycle still points at `<name>.json`, so without
+// this the worker stays protected forever. Restore the record only if it still
+// matches the lifecycle and its report snapshot byte for byte.
+function restoreQuarantinedEvent(pendingDir, pendingPath, expected, sessionRoot) {
+	if (!fs.existsSync(pendingDir)) return;
+	const prefix = `${path.basename(pendingPath)}.corrupt`;
+	const candidates = fs.readdirSync(pendingDir).filter((name) => name === prefix || name.startsWith(`${prefix}.`)).sort();
+	for (const name of candidates) {
+		const quarantined = path.join(pendingDir, name);
+		let event;
+		try {
+			event = readEvent(quarantined, expected);
+			validateEventReport(event, sessionRoot);
+		} catch {
+			continue;
+		}
+		fs.renameSync(quarantined, pendingPath);
+		fsyncDirectory(pendingDir);
+		return;
+	}
+	if (candidates.length > 0) throw new Error(`quarantined completion ${path.join(pendingDir, candidates[0])} does not match the lifecycle`);
+}
+
 function completionRecord(sessionRoot, lifecycle) {
 	if (!lifecycle.spoolName || !lifecycle.eventId || !lifecycle.completionKey || !lifecycle.reportPath || !lifecycle.outcome) return null;
 	ensureSafeLeaf(lifecycle.spoolName, "spoolName");
@@ -383,6 +407,7 @@ function completionRecord(sessionRoot, lifecycle) {
 		reportPath: lifecycle.reportPath,
 	};
 	const pendingPath = path.join(dirs.pendingDir, `${lifecycle.spoolName}.json`);
+	if (!fs.existsSync(pendingPath)) restoreQuarantinedEvent(dirs.pendingDir, pendingPath, expected, sessionRoot);
 	if (fs.existsSync(pendingPath)) {
 		const event = readEvent(pendingPath, expected);
 		validateEventReport(event, sessionRoot);

@@ -22,7 +22,7 @@
     "subagents": "skills/subagents/subagents"
   },
   "scripts": {
-    "test": "bash -n skills/subagents/subagents tests/*.sh && node --check skills/subagents/state.mjs && node --experimental-strip-types --test tests/config.test.ts && bash tests/cli-smoke.sh && bash tests/cli-reliability.sh && bash tests/cli-lifecycle.sh && bash tests/public-safety.sh"
+    "test": "bash -n skills/subagents/subagents tests/*.sh && node --check skills/subagents/state.mjs && node --experimental-strip-types --test tests/config.test.ts && bash tests/cli-smoke.sh && bash tests/cli-reliability.sh && bash tests/cli-lifecycle.sh && bash tests/cli-publish-idempotency.sh && bash tests/cli-recovery.sh && bash tests/public-safety.sh"
   },
   "pi": {
     "extensions": [

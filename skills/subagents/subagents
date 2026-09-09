@@ -23,6 +23,8 @@
 #   subagents ls                        List workers without task text.
 #   subagents cleanup                   Apply the configured completed-worker cleanup policy now.
 #   subagents stop <id|--all>           Stop panes while preserving reports and delivery state.
+#   subagents repair-duplicate-after-ack <id> <event-id> --session-file FILE [--apply]
+#                                       Dry-run or quarantine a validated duplicate pending event after acknowledgement.
 #   subagents purge <id|--all>          Delete stopped state only after every report is acknowledged.
 
 set -uo pipefail
@@ -757,13 +759,43 @@ sync_snapshot_sequence() {
 }
 
 publish_report_locked() {
-	local id="$1" generation="$2" outcome="$3" source="$4" dir checksum bytes status completion_key event_id spool_name pending target report_arg report_path now existed=0
+	local id="$1" generation="$2" outcome="$3" source="$4" dir checksum bytes status completion_key event_id spool_name pending target report_arg report_path now existed=0 plan action
 	dir=$(sadir "$id")
 	read -r checksum bytes <<<"$(cksum <"$source")"
 	case "$outcome" in completed) status="done" ;; blocked) status="blocked" ;; *) return 2 ;; esac
 	completion_key="$id:$status:$generation:$checksum:$bytes"
 	event_id=$(node "$STATE_HELPER" event-id "$id" "$generation" "$status" "$completion_key") || return 2
 	spool_name="$id-$generation-$event_id"
+	if ! plan=$(node "$STATE_HELPER" publish-plan "$dir/lifecycle.json" "$(sr)" "$outcome" "$generation" \
+		"$completion_key" "$spool_name" "$event_id"); then
+		echo "subagents: publication state for subagent #$id is not eligible" >&2
+		return 2
+	fi
+	IFS=$'\t' read -r action report_path <<<"$plan"
+	if [ "$action" = published ]; then
+		if [ -n "$report_path" ] && { [ ! -f "$dir/result.md" ] || ! cmp -s "$report_path" "$dir/result.md"; }; then
+			if ! node "$STATE_HELPER" replace-snapshot "$report_path" "$dir/result.md"; then
+				echo "subagents: completion is durable, but could not update current report for subagent #$id" >&2
+				return 2
+			fi
+		fi
+		return 3
+	fi
+	if [ "$action" = archived ]; then
+		now=$(date +%s)
+		if ! node "$STATE_HELPER" finish-publish "$dir/lifecycle.json" "$outcome" "$now" "$generation" \
+			"$completion_key" "$spool_name" "$event_id" "$report_path"; then
+			echo "subagents: could not commit lifecycle completion for subagent #$id" >&2
+			return 2
+		fi
+		if ! node "$STATE_HELPER" replace-snapshot "$report_path" "$dir/result.md"; then
+			echo "subagents: completion is durable, but could not update current report for subagent #$id" >&2
+			return 2
+		fi
+		sync_snapshot_sequence "$dir"
+		return 3
+	fi
+	[ "$action" = new ] || { echo "subagents: unknown publication plan for subagent #$id" >&2; return 2; }
 	pending="$(sr)/.watcher-pending"
 	target="$pending/$spool_name.json"
 	mkdir -p "$pending" || return 2
@@ -1400,6 +1432,34 @@ cmd_cleanup() {
 	[ "$CLEANUP_FAILURES" = 0 ]
 }
 
+cmd_repair_duplicate_after_ack() {
+	local id="${1:-}" event_id="${2:-}" session_file="" mode="dry-run" retain_flag=0 source_revision command_line dir rc
+	[ -n "$id" ] && [ -n "$event_id" ] || die "usage: subagents repair-duplicate-after-ack <id> <event-id> --session-file FILE [--apply]"
+	shift 2
+	while [ $# -gt 0 ]; do
+		case "$1" in
+			--session-file) [ $# -ge 2 ] && [ -n "$2" ] || die "--session-file needs a value"; session_file="$2"; shift 2 ;;
+			--apply) mode=apply; shift ;;
+			--dry-run) mode=dry-run; shift ;;
+			--retain-before-quarantine) retain_flag=1; shift ;;
+			*) die "unknown repair option '$1'" ;;
+		esac
+	done
+	case "$id" in ''|*[!0-9]*) die "invalid subagent id '${id:-<empty>}'" ;; esac
+	printf '%s\n' "$event_id" | grep -Eq '^[a-f0-9]{64}$' || die "invalid event id"
+	[ -n "$session_file" ] || die "--session-file is required"
+	[ -f "$session_file" ] && [ ! -L "$session_file" ] || die "session evidence file is missing or not a regular file"
+	dir=$(sadir "$id"); [ -d "$dir" ] || die "no subagent #$id"
+	source_revision=$(git -C "$PACKAGE_ROOT" rev-parse HEAD 2>/dev/null || printf '%s' unknown)
+	command_line="repair-duplicate-after-ack $id $event_id --session-file $session_file"
+	[ "$mode" = apply ] && command_line="$command_line --apply"
+	[ "$retain_flag" = 1 ] && command_line="$command_line --retain-before-quarantine"
+	lock_acquire "$dir/.event.lock" "event consumer for subagent #$id"
+	node "$STATE_HELPER" repair-duplicate-after-ack "$(sr)" "$id" "$event_id" "$session_file" "$mode" "$source_revision" "$command_line" "$(date +%s)"; rc=$?
+	lock_release
+	return "$rc"
+}
+
 ack_cli() {
 	local id="${1:-}" event_id="${2:-}" pending_name="${3:-}" dir pending_path
 	[ -n "$id" ] && [ -n "$event_id" ] && [ -n "$pending_name" ] || die "invalid watcher acknowledgement"
@@ -1450,7 +1510,7 @@ case "$cmd" in
 	models) cmd_models "$@" ;;
 	_refresh-model-cache) refresh_model_cache ;;
 	""|-h|--help|help) usage ;;
-	doctor|run|publish|tell|retain|release|wait|events|reap|status|peek|ls|cleanup|stop|purge|ack)
+	doctor|run|publish|tell|retain|release|wait|events|reap|status|peek|ls|cleanup|stop|repair-duplicate-after-ack|purge|ack)
 		prepare_session_state
 		case "$cmd" in
 			doctor) cmd_doctor "$@" ;;
@@ -1467,6 +1527,7 @@ case "$cmd" in
 			ls) cmd_ls "$@" ;;
 			cleanup) cmd_cleanup "$@" ;;
 			stop) cmd_stop "$@" ;;
+			repair-duplicate-after-ack) cmd_repair_duplicate_after_ack "$@" ;;
 			purge) cmd_purge "$@" ;;
 			ack) ack_cli "$@" ;;
 		esac

@@ -65,22 +65,26 @@ The generated protocol tells a worker to write `report.next.md`, then call:
 subagents publish <id> <completed|blocked> <report.next.md> <generation>
 ```
 
-Publication holds `.event.lock` and verifies the exact lifecycle generation and
-fixed report source path. It then:
+Publication holds `.event.lock`, computes the desired completion identity, and
+verifies the exact lifecycle generation and fixed report source path before
+writing a new snapshot or spool record. It then:
 
 1. creates a new immutable `reports/<n>.md` using temporary-file write, file
    `fsync`, atomic rename, and reports-directory `fsync`;
-2. computes a completion key and deterministic event id;
-3. writes the strict event to `.watcher-pending/<spool>.json` using file `fsync`,
+2. writes the strict event to `.watcher-pending/<spool>.json` using file `fsync`,
    atomic rename, and pending-directory `fsync`;
-4. atomically writes lifecycle `awaiting-follow-up` or `blocked`;
-5. atomically refreshes `result.md` from the immutable snapshot.
+3. atomically writes lifecycle `awaiting-follow-up` or `blocked`;
+4. atomically refreshes `result.md` from the immutable snapshot.
 
 The complete report therefore precedes the durable completion record, and the
-record precedes lifecycle cleanup eligibility. A crash after step 3 can be
-retried: the deterministic event is validated and reused before the lifecycle
-transition. Snapshot names are never overwritten. An orphan snapshot from a
-crash before queue persistence remains visible and blocks purge.
+record precedes lifecycle cleanup eligibility. A crash after spool persistence
+can be retried: the deterministic event is validated and reused before the
+lifecycle transition. Repeating an already-published completed or blocked
+request with the same completion identity validates the existing pending or
+archived event and returns success without creating another snapshot or event.
+A non-identical repeat fails before side effects. Snapshot names are never
+overwritten. An orphan snapshot from a crash before queue persistence remains
+visible and blocks purge.
 
 `@@DONE@@` is a behavioral signal for the worker transcript, not a state
 transition. A non-empty `result.md`, non-empty `report.next.md`, quiet pane, or
@@ -128,6 +132,15 @@ lose the pending event.
 
 Pull delivery uses the same event and acknowledgement operation. `wait` and
 `reap` acknowledge only after printing the immutable report succeeds.
+
+The narrow `repair-duplicate-after-ack` command is dry-run by default and is for
+reviewed duplicate-pending incidents only. Before dry-run or apply succeeds it
+requires regular, non-symlink lifecycle, archive, pending, delivery marker,
+report snapshot, mutable result/report-next, and session-evidence files; state
+paths below the session root must not traverse symlinked worker, pending,
+archive, delivered, reports, or quarantine directories. Apply retains the worker
+and atomically moves only the duplicate pending record into a same-session-root
+quarantine directory with fsynced manifests.
 
 ## Cleanup lease
 

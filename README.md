@@ -324,6 +324,8 @@ node --experimental-strip-types --test tests/config.test.ts
 bash tests/cli-smoke.sh
 bash tests/cli-reliability.sh
 bash tests/cli-lifecycle.sh
+bash tests/cli-publish-idempotency.sh
+bash tests/cli-recovery.sh
 bash tests/public-safety.sh
 git diff --check
 ```
@@ -331,8 +333,10 @@ git diff --check
 The suite covers repeated concurrent launch contention, abandoned locks,
 protocol and state mismatches, model validation and close-match errors,
 effective model/reasoning inheritance, atomic
-publication recovery, at-least-once watcher acknowledgement, lifecycle
-transitions, report preservation, cleanup defaults and grace, dry-run/off/notify,
+publication recovery, duplicate publish idempotency after acknowledgement,
+duplicate-pending recovery validation including symlink and special-file
+rejection, at-least-once watcher acknowledgement, lifecycle transitions, report preservation,
+cleanup defaults and grace, dry-run/off/notify,
 retain/release/tell cancellation, and protection for blocked, working, unknown,
 malformed, and unpublished workers.
 

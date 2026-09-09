@@ -302,6 +302,37 @@ function transition(file, operation, now, args) {
 	return next;
 }
 
+function publishPlan(file, sessionRoot, outcome, generation, completionKey, spoolName, eventId) {
+	const current = readLifecycle(file);
+	if (current.generation !== generation) throw new Error("worker lease changed during report publication");
+	ensureSafeLeaf(spoolName, "spoolName");
+	if (!/^[a-f0-9]{64}$/.test(eventId)) throw new Error("eventId is invalid");
+	const targetState = outcome === "blocked" ? "blocked" : "awaiting-follow-up";
+	if (current.state === "working") {
+		const dirs = agentDirectories(sessionRoot, current.id);
+		const archivePath = path.join(dirs.archiveDir, `${eventId}.json`);
+		if (fs.existsSync(archivePath)) {
+			const event = readEvent(archivePath, { id: current.id, generation, status: expectedStatus(outcome), outcome, completionKey, eventId });
+			validateEventReport(event, sessionRoot);
+			if (!fs.existsSync(path.join(dirs.deliveredDir, eventId))) throw new Error("archived publication is missing its delivery marker");
+			return { action: "archived", reportPath: event.reportPath };
+		}
+		return { action: "new", reportPath: null };
+	}
+	if (
+		current.state === targetState &&
+		current.outcome === outcome &&
+		current.completionKey === completionKey &&
+		current.spoolName === spoolName &&
+		current.eventId === eventId
+	) {
+		const completion = completionRecord(sessionRoot, current);
+		if (!completion) throw new Error("existing publication is neither durably queued nor acknowledged");
+		return { action: "published", reportPath: completion.event.reportPath };
+	}
+	throw new Error(`cannot publish from ${current.state}`);
+}
+
 function finishPublish(file, outcome, now, generation, completionKey, spoolName, eventId, reportPath) {
 	const current = readLifecycle(file);
 	if (current.generation !== generation) throw new Error("worker lease changed during report publication");
@@ -405,6 +436,13 @@ function ensureSpool(target, expected, reportPath, createdAt, sessionRoot) {
 		validateEventReport(event, sessionRoot);
 		return event;
 	}
+	const { archiveDir } = agentDirectories(sessionRoot, expected.id);
+	const archivePath = path.join(archiveDir, `${expected.eventId}.json`);
+	if (fs.existsSync(archivePath)) {
+		const event = readEvent(archivePath, expected);
+		validateEventReport(event, sessionRoot);
+		throw new Error("completion event is already archived");
+	}
 	if (!reportPath) throw new Error("durable completion record is missing after an interrupted publication");
 	const reportBody = fs.readFileSync(reportPath, "utf8");
 	const event = validateEvent({
@@ -460,6 +498,267 @@ function acknowledge(sessionRoot, id, eventId, pendingPath, now) {
 		fsyncDirectory(dirs.pendingDir);
 		fsyncDirectory(dirs.archiveDir);
 	}
+}
+
+function sha256File(file) {
+	return createHash("sha256").update(fs.readFileSync(file)).digest("hex");
+}
+
+function fileType(stat) {
+	if (stat.isSymbolicLink()) return "symlink";
+	if (stat.isFile()) return "file";
+	if (stat.isDirectory()) return "directory";
+	return "other";
+}
+
+function fileMetadata(file) {
+	try {
+		const stat = fs.lstatSync(file, { bigint: true });
+		return {
+			path: file,
+			exists: true,
+			type: fileType(stat),
+			size: Number(stat.size),
+			mode: `0o${(Number(stat.mode) & 0o777).toString(8)}`,
+			mtimeNs: stat.mtimeNs.toString(),
+			sha256: stat.isFile() ? sha256File(file) : null,
+		};
+	} catch (error) {
+		if (error.code === "ENOENT") return { path: file, exists: false };
+		throw error;
+	}
+}
+
+function assertPathUnderBaseNoSymlinks(candidate, base, label) {
+	const absoluteBase = path.resolve(base);
+	const absoluteCandidate = path.resolve(candidate);
+	const relative = path.relative(absoluteBase, absoluteCandidate);
+	if (!relative || relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+		throw new Error(`${label} is outside the expected state directory`);
+	}
+	let current = absoluteBase;
+	for (const part of relative.split(path.sep)) {
+		current = path.join(current, part);
+		const stat = fs.lstatSync(current);
+		if (stat.isSymbolicLink()) throw new Error(`${label} path contains a symlink`);
+	}
+	const realBase = fs.realpathSync(absoluteBase);
+	const realCandidate = fs.realpathSync(absoluteCandidate);
+	const realRelative = path.relative(realBase, realCandidate);
+	if (!realRelative || realRelative === ".." || realRelative.startsWith(`..${path.sep}`) || path.isAbsolute(realRelative)) {
+		throw new Error(`${label} resolves outside the expected state directory`);
+	}
+}
+
+function assertRegularFile(file, label, base) {
+	if (base) assertPathUnderBaseNoSymlinks(file, base, label);
+	const stat = fs.lstatSync(file);
+	if (stat.isSymbolicLink()) throw new Error(`${label} must not be a symlink`);
+	if (!stat.isFile()) throw new Error(`${label} is not a regular file`);
+}
+
+function assertOptionalRegularFile(file, label, base) {
+	let stat;
+	try {
+		stat = fs.lstatSync(file);
+	} catch (error) {
+		if (error.code === "ENOENT") return false;
+		throw error;
+	}
+	if (base) assertPathUnderBaseNoSymlinks(file, base, label);
+	if (stat.isSymbolicLink()) throw new Error(`${label} must not be a symlink`);
+	if (!stat.isFile()) throw new Error(`${label} is not a regular file`);
+	return true;
+}
+
+function assertDirectory(file, label, base) {
+	if (base) assertPathUnderBaseNoSymlinks(file, base, label);
+	const stat = fs.lstatSync(file);
+	if (stat.isSymbolicLink()) throw new Error(`${label} must not be a symlink`);
+	if (!stat.isDirectory()) throw new Error(`${label} is not a directory`);
+}
+
+function redactedEvent(event) {
+	return {
+		...event,
+		reportBody: undefined,
+		reportBodySha256: createHash("sha256").update(event.reportBody).digest("hex"),
+		reportBodyBytes: Buffer.byteLength(event.reportBody),
+	};
+}
+
+function findPersistedReport(sessionFile, expected) {
+	if (!sessionFile) throw new Error("session evidence file is required");
+	assertRegularFile(sessionFile, "session evidence file");
+	const matches = [];
+	const lines = fs.readFileSync(sessionFile, "utf8").split("\n");
+	for (let index = 0; index < lines.length; index += 1) {
+		const line = lines[index];
+		if (!line.trim()) continue;
+		let entry;
+		try { entry = JSON.parse(line); } catch { continue; }
+		if (!entry || entry.type !== "custom_message" || entry.customType !== "subagent-report") continue;
+		const details = entry.details ?? {};
+		if (
+			details.id === expected.id &&
+			details.status === expected.status &&
+			details.eventId === expected.eventId &&
+			details.reportPath === expected.reportPath
+		) {
+			matches.push({ line: index + 1, entryId: entry.id, timestamp: entry.timestamp });
+		}
+	}
+	if (matches.length === 0) throw new Error("persisted custom_message evidence was not found");
+	return { sessionFile, matches };
+}
+
+function assertOnlyDuplicateEventDiff(archived, pending) {
+	const allowed = new Set(["createdAt", "reportPath"]);
+	for (const key of EVENT_KEYS) {
+		if (allowed.has(key)) continue;
+		if (JSON.stringify(archived[key]) !== JSON.stringify(pending[key])) {
+			throw new Error(`pending event differs from archive in ${key}`);
+		}
+	}
+	if (archived.reportPath === pending.reportPath) throw new Error("pending event does not point at a duplicate report path");
+	if (archived.reportBody !== pending.reportBody) throw new Error("pending event report body differs from archive");
+}
+
+function repairDuplicateAfterAck(sessionRoot, id, eventId, sessionFile, mode, sourceRevision, commandLine, now) {
+	const dryRun = mode !== "apply";
+	const lifecyclePath = path.join(sessionRoot, id, "lifecycle.json");
+	assertRegularFile(lifecyclePath, "lifecycle", sessionRoot);
+	const lifecycle = readLifecycle(lifecyclePath);
+	if (lifecycle.id !== id) throw new Error("lifecycle id does not match repair target");
+	if (lifecycle.state !== "awaiting-follow-up" || lifecycle.outcome !== "completed") {
+		throw new Error("repair target is not an acknowledged completed lifecycle");
+	}
+	if (lifecycle.eventId !== eventId) throw new Error("lifecycle eventId does not match repair target");
+	if (!lifecycle.spoolName || !lifecycle.reportPath || !lifecycle.completionKey) throw new Error("lifecycle publication is incomplete");
+	const status = expectedStatus(lifecycle.outcome);
+	const dirs = agentDirectories(sessionRoot, id);
+	const pendingPath = path.join(dirs.pendingDir, `${lifecycle.spoolName}.json`);
+	const archivePath = path.join(dirs.archiveDir, `${eventId}.json`);
+	const markerPath = path.join(dirs.deliveredDir, eventId);
+	const expectedBase = {
+		id,
+		generation: lifecycle.generation,
+		status,
+		outcome: lifecycle.outcome,
+		completionKey: lifecycle.completionKey,
+		eventId,
+	};
+	assertRegularFile(archivePath, "archived event", sessionRoot);
+	assertRegularFile(markerPath, "delivery marker", sessionRoot);
+	assertRegularFile(lifecycle.reportPath, "acknowledged report", sessionRoot);
+	assertRegularFile(pendingPath, "pending event", sessionRoot);
+	const archived = readEvent(archivePath, { ...expectedBase, reportPath: lifecycle.reportPath });
+	validateEventReport(archived, sessionRoot);
+	if (!/^\d+\n?$/.test(fs.readFileSync(markerPath, "utf8"))) throw new Error("delivery marker timestamp is invalid");
+	const evidence = findPersistedReport(sessionFile, { id, status, eventId, reportPath: lifecycle.reportPath });
+	const pending = readEvent(pendingPath, expectedBase);
+	const duplicateReport = pending.reportPath;
+	if (!inside(duplicateReport, dirs.reportsDir)) throw new Error("duplicate report path is outside reports directory");
+	assertRegularFile(duplicateReport, "duplicate report", sessionRoot);
+	validateEventReport(pending, sessionRoot);
+	assertOnlyDuplicateEventDiff(archived, pending);
+	if (fs.readFileSync(duplicateReport, "utf8") !== archived.reportBody) throw new Error("duplicate report body does not match archive");
+
+	for (const [label, file] of Object.entries({ result: path.join(dirs.agentDir, "result.md"), reportNext: path.join(dirs.agentDir, "report.next.md") })) {
+		if (!assertOptionalRegularFile(file, label, sessionRoot)) continue;
+		const stat = fs.lstatSync(file);
+		if (stat.size > 0 && fs.readFileSync(file, "utf8") !== archived.reportBody) {
+			throw new Error(`${label} does not match archived report body`);
+		}
+	}
+
+	const paths = {
+		lifecycle: lifecyclePath,
+		archive: archivePath,
+		pending: pendingPath,
+		deliveredMarker: markerPath,
+		acknowledgedReport: lifecycle.reportPath,
+		duplicateReport,
+		result: path.join(dirs.agentDir, "result.md"),
+		reportNext: path.join(dirs.agentDir, "report.next.md"),
+		protocol: path.join(dirs.agentDir, "protocol.md"),
+		pane: path.join(dirs.agentDir, "pane"),
+	};
+	const preMetadata = Object.fromEntries(Object.entries(paths).map(([label, file]) => [label, fileMetadata(file)]));
+	const preManifest = {
+		command: "repair-duplicate-after-ack",
+		version: 1,
+		dryRun,
+		timestamp: now,
+		sourceRevision,
+		commandLine,
+		sessionRoot,
+		id,
+		eventId,
+		lifecycle: { ...lifecycle },
+		evidence,
+		expectedEventDiff: ["createdAt", "reportPath"],
+		archiveEvent: redactedEvent(archived),
+		pendingEvent: redactedEvent(pending),
+		files: preMetadata,
+	};
+	if (dryRun) {
+		return { dryRun: true, action: "would-quarantine", retained: lifecycle.retained, manifest: preManifest };
+	}
+
+	const quarantineRoot = path.join(sessionRoot, ".recovery-quarantine");
+	try {
+		fs.lstatSync(quarantineRoot);
+		assertDirectory(quarantineRoot, "quarantine root", sessionRoot);
+	} catch (error) {
+		if (error.code !== "ENOENT") throw error;
+		fs.mkdirSync(quarantineRoot, { mode: 0o700 });
+		assertDirectory(quarantineRoot, "quarantine root", sessionRoot);
+		fsyncDirectory(sessionRoot);
+	}
+	fs.chmodSync(quarantineRoot, 0o700);
+	const stamp = new Date(now * 1000).toISOString().replace(/[^0-9A-Za-z.-]/g, "_");
+	const quarantineDir = path.join(quarantineRoot, `worker${id}-${eventId}-${stamp}-${randomUUID()}`);
+	fs.mkdirSync(quarantineDir, { mode: 0o700 });
+	assertDirectory(quarantineDir, "quarantine directory", sessionRoot);
+	fsyncDirectory(quarantineRoot);
+	atomicWriteJson(path.join(quarantineDir, "manifest.pre.json"), preManifest);
+
+	if (!lifecycle.retained || lifecycle.candidateSince !== null || lifecycle.noticeKey !== null) {
+		writeLifecycle(lifecyclePath, {
+			...lifecycle,
+			retained: true,
+			candidateSince: null,
+			noticeKey: null,
+			updatedAt: now,
+		});
+	}
+	const quarantinedPending = path.join(quarantineDir, `pending.${path.basename(pendingPath)}`);
+	assertRegularFile(pendingPath, "pending event", sessionRoot);
+	assertDirectory(quarantineDir, "quarantine directory", sessionRoot);
+	fs.renameSync(pendingPath, quarantinedPending);
+	assertRegularFile(quarantinedPending, "quarantined pending event", sessionRoot);
+	fsyncDirectory(dirs.pendingDir);
+	fsyncDirectory(quarantineDir);
+	const postLifecycle = readLifecycle(lifecyclePath);
+	const postManifest = {
+		...preManifest,
+		dryRun: false,
+		quarantineDir,
+		quarantinedPending,
+		postLifecycle: { ...postLifecycle },
+		postFiles: {
+			lifecycle: fileMetadata(lifecyclePath),
+			archive: fileMetadata(archivePath),
+			pending: fileMetadata(pendingPath),
+			quarantinedPending: fileMetadata(quarantinedPending),
+			deliveredMarker: fileMetadata(markerPath),
+			acknowledgedReport: fileMetadata(lifecycle.reportPath),
+			duplicateReport: fileMetadata(duplicateReport),
+		},
+	};
+	atomicWriteJson(path.join(quarantineDir, "manifest.post.json"), postManifest);
+	return { dryRun: false, action: "quarantined", quarantineDir, quarantinedPending };
 }
 
 function purgeCheck(agentDir, sessionRoot) {
@@ -555,6 +854,16 @@ try {
 			if (!file || !operation || !nonNegativeInteger(now)) throw new Error("invalid transition input");
 			const next = transition(file, operation, now, rest);
 			process.stdout.write(`${JSON.stringify(next)}\n`);
+			break;
+		}
+		case "publish-plan": {
+			const [file, sessionRoot, outcome, rawGeneration, completionKey, spoolName, eventId] = args;
+			const generation = Number(rawGeneration);
+			if (!["completed", "blocked"].includes(outcome) || !Number.isSafeInteger(generation) || generation < 1) {
+				throw new Error("invalid publish plan input");
+			}
+			const plan = publishPlan(file, sessionRoot, outcome, generation, completionKey, spoolName, eventId);
+			process.stdout.write(`${plan.action}${plan.reportPath ? `\t${plan.reportPath}` : ""}\n`);
 			break;
 		}
 		case "finish-publish": {
@@ -657,6 +966,16 @@ try {
 				throw new Error("invalid acknowledgement input");
 			}
 			acknowledge(sessionRoot, id, eventId, pendingPath, now);
+			break;
+		}
+		case "repair-duplicate-after-ack": {
+			const [sessionRoot, id, eventId, sessionFile, mode, sourceRevision = "unknown", commandLine = "", rawNow] = args;
+			const now = Number(rawNow);
+			if (!/^\d+$/.test(id ?? "") || !/^[a-f0-9]{64}$/.test(eventId ?? "") || !sessionFile || !["dry-run", "apply"].includes(mode) || !nonNegativeInteger(now)) {
+				throw new Error("invalid duplicate repair input");
+			}
+			const result = repairDuplicateAfterAck(sessionRoot, id, eventId, sessionFile, mode, sourceRevision, commandLine, now);
+			process.stdout.write(`${JSON.stringify(result)}\n`);
 			break;
 		}
 		case "purge-check": {

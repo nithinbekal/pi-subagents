@@ -26,6 +26,10 @@
 #   subagents purge <id|--all>          Delete stopped state only after every report is acknowledged.
 
 set -uo pipefail
+# The watcher destroys our stdout/stderr before it signals a timeout. A default
+# SIGPIPE would kill the CLI without running the lock traps and leave an
+# abandoned lock behind; with it ignored, writes fail harmlessly with EPIPE.
+trap '' PIPE
 
 PI_CMD="${SUBAGENTS_PI:-pi}"
 STATE_DIR="${SUBAGENTS_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/subagents}"
@@ -160,7 +164,26 @@ subagents_windows() {
 
 subagents_window() { subagents_windows "$1" | head -1; }
 
+# `events` snapshots the pane list once instead of asking tmux per agent. The
+# snapshot may only prove a pane alive: a pane absent from it (launched after
+# the snapshot, or the snapshot failed) is re-queried live before it counts as dead.
+PANE_SNAPSHOT=""
+PANE_SNAPSHOT_ACTIVE=0
+
+pane_snapshot_begin() {
+	PANE_SNAPSHOT=$(tmux list-panes -a -F '#{pane_id} #{pane_dead}' 2>/dev/null || true)
+	PANE_SNAPSHOT_ACTIVE=1
+}
+
+pane_snapshot_end() {
+	PANE_SNAPSHOT=""
+	PANE_SNAPSHOT_ACTIVE=0
+}
+
 pane_alive() {
+	if [ "$PANE_SNAPSHOT_ACTIVE" = 1 ] && printf '%s\n' "$PANE_SNAPSHOT" | awk -v p="$1" '$1==p{print $2}' | grep -qx 0; then
+		return 0
+	fi
 	tmux list-panes -a -F '#{pane_id} #{pane_dead}' 2>/dev/null \
 		| awk -v p="$1" '$1==p{print $2}' | grep -qx 0
 }
@@ -1241,15 +1264,38 @@ cmd_wait() {
 	return 1
 }
 
+# One node process prescreens every agent; locks and tmux queries are taken
+# only for agents that may need work. Without a usable scan, fall back to the
+# exhaustive per-agent path.
 cmd_events() {
-	local dir id rc failures=0
-	for dir in "$(sr)"/*/; do
-		[ -d "$dir" ] || continue
-		id=$(basename "$dir"); case "$id" in ''|*[!0-9]*) continue ;; esac
-		detect_and_emit "$id" 1; rc=$?
-		[ "$rc" = 2 ] && failures=$((failures + 1))
-	done
-	run_cleanup events || failures=$((failures + CLEANUP_FAILURES))
+	local scan id detect cleanup rc failures=0
+	pane_snapshot_begin
+	if scan=$(node "$STATE_HELPER" scan "$(sr)" "$(date +%s)" "$CLEANUP_GRACE_SECONDS" 2>/dev/null); then
+		while IFS=$'\t' read -r id detect cleanup; do
+			[ -n "$id" ] && [ "$detect" = 1 ] || continue
+			detect_and_emit "$id" 1; rc=$?
+			[ "$rc" = 2 ] && failures=$((failures + 1))
+		done <<<"$scan"
+		if [ "$CLEANUP_MODE" != off ]; then
+			CLEANUP_ACTIONS=0
+			CLEANUP_FAILURES=0
+			while IFS=$'\t' read -r id detect cleanup; do
+				[ -n "$id" ] && [ "$cleanup" = 1 ] || continue
+				cleanup_one "$id" events || true
+			done <<<"$scan"
+			failures=$((failures + CLEANUP_FAILURES))
+		fi
+	else
+		local dir
+		for dir in "$(sr)"/*/; do
+			[ -d "$dir" ] || continue
+			id=$(basename "$dir"); case "$id" in ''|*[!0-9]*) continue ;; esac
+			detect_and_emit "$id" 1; rc=$?
+			[ "$rc" = 2 ] && failures=$((failures + 1))
+		done
+		run_cleanup events || failures=$((failures + CLEANUP_FAILURES))
+	fi
+	pane_snapshot_end
 	[ "$failures" = 0 ]
 }
 

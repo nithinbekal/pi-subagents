@@ -106,6 +106,18 @@ printf '%s\n' '999999 unknown abandoned-event 1' >"\$session_root/1/.event.lock"
 [ ! -s "$TMP/events.out" ]
 grep -Fq 'recovered abandoned event consumer for subagent #1 lock' "$TMP/events.err"
 
+# The watcher closes the CLI's stdio before signalling a timeout. A closed stderr
+# must not kill the CLI mid-critical-section and leave a lock behind.
+printf '%s\n' '999999 unknown abandoned-event 1' >"\$session_root/2/.event.lock"
+node -e '
+const { execFile } = require("child_process");
+const child = execFile(process.argv[1], ["events"], { env: process.env }, () => {});
+child.stdout.destroy(); child.stderr.destroy();
+child.on("exit", (code, signal) => { process.exitCode = signal === "SIGPIPE" ? 1 : 0; });
+' "$CLI"
+[ ! -e "\$session_root/2/.event.lock" ]
+find "\$session_root" -name '.event.lock' -maxdepth 2 | grep -q . && exit 1
+
 # Queue failure leaves the lifecycle working and the report untouched. A retry
 # after storage recovery publishes exactly once.
 "$CLI" run "manual-publish queue-failure" >"$TMP/run.31.out" 2>"$TMP/run.31.err"

@@ -214,6 +214,22 @@ export default function subagentsWatch(pi: ExtensionAPI) {
 		if (context?.hasUI) context.ui.notify(`subagents watcher: ${diagnostic}`, "error");
 	};
 
+	// Lock recovery is a routine self-heal after a killed CLI. Surface each
+	// recovered lock once (owner pid and time vary per occurrence) and relay
+	// everything else verbatim.
+	const relayCliStderr = (stderr: string): void => {
+		for (const line of stderr.split("\n")) {
+			const text = line.trim();
+			if (!text) continue;
+			if (text.includes("recovered abandoned")) {
+				const key = text.replace(/\s*\(pid \d+, acquired \d+\)$/, "");
+				if (reportedErrors.has(key)) continue;
+				reportedErrors.add(key);
+			}
+			console.error(`[subagents-watch] ${text}`);
+		}
+	};
+
 	const reportCommandError = (operation: string, error: ExecFileException, stderr: string, startedAt: number): void => {
 		const message = stderr.trim() || error.message.trimEnd();
 		const facts = `code=${String(error.code)}, signal=${String(error.signal)}, killed=${String(error.killed)}`;
@@ -463,7 +479,7 @@ export default function subagentsWatch(pi: ExtensionAPI) {
 			execFile(bin, ["events"], { encoding: "utf8", timeout: COMMAND_TIMEOUT_MS, env: process.env }, (error, _stdout, stderr) => {
 				try {
 					if (error) reportCommandError("event detection or cleanup failed", error, stderr, startedAt);
-					else if (stderr.trim()) console.error(`[subagents-watch] ${stderr.trim()}`);
+					else relayCliStderr(stderr);
 					if (stateContractReady()) {
 						reconcilePersistedDeliveries();
 						flushQueuedEvents();

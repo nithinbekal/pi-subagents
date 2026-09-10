@@ -608,6 +608,35 @@ try {
 			process.stdout.write(`${lifecycle.generation}\t${lifecycle.candidateSince}\t${lifecycle.eventId}\n`);
 			break;
 		}
+		// Lock-free prescreen for `events`. It only decides which agents are worth a
+		// lock; every locked path re-reads the lifecycle, so a stale answer costs one
+		// tick, never correctness. An agent whose lock file exists is always worth a
+		// visit so lock_acquire can recover it when its owner is gone.
+		case "scan": {
+			const [sessionRoot, rawNow, rawGrace] = args;
+			const now = Number(rawNow);
+			const grace = Number(rawGrace);
+			if (!nonNegativeInteger(now) || !nonNegativeInteger(grace)) throw new Error("invalid scan time");
+			const ids = fs.readdirSync(sessionRoot, { withFileTypes: true })
+				.filter((entry) => entry.isDirectory() && /^\d+$/.test(entry.name))
+				.map((entry) => entry.name)
+				.sort((a, b) => Number(a) - Number(b));
+			for (const id of ids) {
+				let detect = 1;
+				let cleanup = 1;
+				try {
+					const lifecycle = readLifecycle(path.join(sessionRoot, id, "lifecycle.json"));
+					detect = lifecycle.state === "starting" || lifecycle.state === "working"
+						|| fs.existsSync(path.join(sessionRoot, id, ".event.lock")) ? 1 : 0;
+					cleanup = lifecycle.state === "awaiting-follow-up" && !lifecycle.retained
+						&& lifecycle.candidateSince !== null && now - lifecycle.candidateSince >= grace ? 1 : 0;
+				} catch {
+					// Missing or malformed lifecycle: let the locked paths report it as before.
+				}
+				process.stdout.write(`${id}\t${detect}\t${cleanup}\n`);
+			}
+			break;
+		}
 		case "pending": {
 			const [file, sessionRoot] = args;
 			const lifecycle = readLifecycle(file);

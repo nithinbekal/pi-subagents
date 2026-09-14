@@ -273,6 +273,7 @@ State is partitioned by tmux's stable session id (`$1`, `$2`, and so on):
 
 ```text
 $SUBAGENTS_STATE_DIR/
+├── watcher.log                      # watcher diagnostics, all sessions; rotated to watcher.log.1 at 1 MB
 └── $1/
     ├── .schema.json                 # exact protocol.json contract
     ├── .seq                         # monotonic worker id
@@ -292,6 +293,11 @@ $SUBAGENTS_STATE_DIR/
         ├── reports/                 # immutable report snapshots
         └── events/                  # acknowledged completion records
 ```
+
+The watcher never writes to the terminal while Pi has a UI: every diagnostic
+is appended to `watcher.log` (timestamp, level, tmux session, message), and
+the first occurrence of each distinct error is also shown as a Pi
+notification. Repeats and routine lock recoveries land only in the log.
 
 See [`docs/state.md`](docs/state.md) for lifecycle transitions, validation
 invariants, lock behavior, and crash boundaries.

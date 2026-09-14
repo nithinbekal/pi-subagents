@@ -34,6 +34,8 @@ import {
 } from "./config.ts";
 
 const PREVIEW_CHARS = 1500;
+const WATCHER_LOG_NAME = "watcher.log";
+const WATCHER_LOG_MAX_BYTES = 1_000_000;
 const DEFAULT_WATCH_MS = 3000;
 const COMMAND_TIMEOUT_MS = 10_000;
 const DELIVERY_RETRY_MS = 30 * 60_000;
@@ -204,14 +206,40 @@ export default function subagentsWatch(pi: ExtensionAPI) {
 	const ackPromises = new Map<string, Promise<void>>();
 	const reportedErrors = new Set<string>();
 
+	// The interactive TUI owns the whole screen; a stray console.error line
+	// shifts its rows and leaves a duplicated footer behind. Every diagnostic is
+	// appended to watcher.log; the deduplicated ones also reach the user through
+	// ui.notify, and stderr is used only when Pi has no UI (JSON/RPC mode).
+	const appendWatcherLog = (level: "error" | "warning", text: string): void => {
+		const logPath = path.join(stateDir, WATCHER_LOG_NAME);
+		const line = `${new Date().toISOString()} ${level.toUpperCase()} ${sessionDir ? path.basename(sessionDir) : "-"} ${text}\n`;
+		try {
+			fs.mkdirSync(stateDir, { recursive: true });
+			try {
+				if (fs.statSync(logPath).size > WATCHER_LOG_MAX_BYTES) fs.renameSync(logPath, `${logPath}.1`);
+			} catch {
+				/* first write */
+			}
+			fs.appendFileSync(logPath, line);
+		} catch {
+			/* a failing log must never break delivery */
+		}
+	};
+
+	const emitDiagnostic = (level: "error" | "warning", text: string, surface: boolean): void => {
+		appendWatcherLog(level, text);
+		if (!surface) return;
+		if (context?.hasUI) context.ui.notify(`subagents watcher: ${text} (see ${path.join(stateDir, WATCHER_LOG_NAME)})`, level);
+		else console.error(`[subagents-watch] ${text}`);
+	};
+
 	const reportError = (operation: string, error: unknown, details?: string): void => {
 		const message = error instanceof Error ? error.message : String(error);
 		const key = `${operation}: ${message}`;
-		if (reportedErrors.has(key)) return;
-		reportedErrors.add(key);
 		const diagnostic = details ? `${key} [${details}]` : key;
-		console.error(`[subagents-watch] ${diagnostic}`);
-		if (context?.hasUI) context.ui.notify(`subagents watcher: ${diagnostic}`, "error");
+		const firstTime = !reportedErrors.has(key);
+		reportedErrors.add(key);
+		emitDiagnostic("error", diagnostic, firstTime);
 	};
 
 	// Lock recovery is a routine self-heal after a killed CLI. Surface each
@@ -223,10 +251,12 @@ export default function subagentsWatch(pi: ExtensionAPI) {
 			if (!text) continue;
 			if (text.includes("recovered abandoned")) {
 				const key = text.replace(/\s*\(pid \d+, acquired \d+\)$/, "");
-				if (reportedErrors.has(key)) continue;
+				const firstTime = !reportedErrors.has(key);
 				reportedErrors.add(key);
+				emitDiagnostic("warning", text, firstTime);
+				continue;
 			}
-			console.error(`[subagents-watch] ${text}`);
+			emitDiagnostic("warning", text, true);
 		}
 	};
 

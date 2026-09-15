@@ -202,7 +202,6 @@ export default function subagentsWatch(pi: ExtensionAPI) {
 
 	const persistedEventIds = new Set<string>();
 	const deliveryAttempts = new Map<string, number>();
-	const queuedEvents = new Map<string, { event: CompletionEvent; queuedPath: string }>();
 	const ackPromises = new Map<string, Promise<void>>();
 	const reportedErrors = new Set<string>();
 
@@ -210,7 +209,7 @@ export default function subagentsWatch(pi: ExtensionAPI) {
 	// shifts its rows and leaves a duplicated footer behind. Every diagnostic is
 	// appended to watcher.log; the deduplicated ones also reach the user through
 	// ui.notify, and stderr is used only when Pi has no UI (JSON/RPC mode).
-	const appendWatcherLog = (level: "error" | "warning", text: string): void => {
+	const appendWatcherLog = (level: "error" | "warning" | "info", text: string): void => {
 		const logPath = path.join(stateDir, WATCHER_LOG_NAME);
 		const line = `${new Date().toISOString()} ${level.toUpperCase()} ${sessionDir ? path.basename(sessionDir) : "-"} ${text}\n`;
 		try {
@@ -241,6 +240,13 @@ export default function subagentsWatch(pi: ExtensionAPI) {
 		reportedErrors.add(key);
 		emitDiagnostic("error", diagnostic, firstTime);
 	};
+
+	// Match only the CLI's committed-cleanup success line, including in failed batches.
+	const logCleanupSuccesses = (stderr: string): string => stderr.split("\n").filter((line) => {
+		if (!/^subagents cleanup: stopped subagent #[0-9]+ after completed report and [0-9]+s grace; state preserved$/.test(line)) return true;
+		appendWatcherLog("info", line);
+		return false;
+	}).join("\n");
 
 	// Lock recovery is a routine self-heal after a killed CLI. Surface each
 	// recovered lock once (owner pid and time vary per occurrence) and relay
@@ -360,7 +366,6 @@ export default function subagentsWatch(pi: ExtensionAPI) {
 					if (error) reportCommandError(`acknowledgement failed for event ${event.eventId}`, error, stderr, startedAt);
 					else {
 						deliveryAttempts.delete(event.eventId);
-						queuedEvents.delete(event.eventId);
 					}
 					resolve();
 				},
@@ -476,7 +481,6 @@ export default function subagentsWatch(pi: ExtensionAPI) {
 				reportError(`incompatible or malformed queued event preserved at ${queuedPath}`, error);
 				continue;
 			}
-			queuedEvents.set(event.eventId, { event, queuedPath });
 			if (deliveredMarkerExists(event.eventId) || persistedEventIds.has(event.eventId)) requestAck(event, queuedPath);
 			else attemptDelivery(event);
 		}
@@ -508,8 +512,9 @@ export default function subagentsWatch(pi: ExtensionAPI) {
 			const startedAt = performance.now();
 			execFile(bin, ["events"], { encoding: "utf8", timeout: COMMAND_TIMEOUT_MS, env: process.env }, (error, _stdout, stderr) => {
 				try {
-					if (error) reportCommandError("event detection or cleanup failed", error, stderr, startedAt);
-					else relayCliStderr(stderr);
+					const diagnostics = logCleanupSuccesses(stderr.trim() ? stderr : error?.message ?? "");
+					if (error) reportCommandError("event detection or cleanup failed", error, diagnostics.trim() || "CLI command failed", startedAt);
+					else relayCliStderr(diagnostics);
 					if (stateContractReady()) {
 						reconcilePersistedDeliveries();
 						flushQueuedEvents();

@@ -59,6 +59,7 @@ root=""
 launch 1
 root=\$(find "$TMP/state" -mindepth 1 -maxdepth 1 -type d -print -quit)
 publish 1 completed
+if grep -Fq '@@DONE@@' "\$root/1/protocol.md"; then echo 'new protocol requires a sentinel' >&2; exit 1; fi
 # The safe default is active but does not ignore its ten-minute grace.
 "$CLI" cleanup >"$TMP/cleanup-default.out" 2>"$TMP/cleanup-default.err"
 grep -Fqx 'cleanup: no eligible completed workers' "$TMP/cleanup-default.out"
@@ -126,6 +127,15 @@ pane_alive_for 5
 [ "\$(state_for 5)" = working ]
 [ -f "\$pending_before" ]
 [ "\$(node -e 'console.log(JSON.parse(require("fs").readFileSync(process.argv[1])).generation)' "\$root/5/lifecycle.json")" = 2 ]
+if grep -Fq '@@DONE@@' "\$root/5/protocol.md"; then echo 'follow-up protocol requires a sentinel' >&2; exit 1; fi
+printf 'generation two report\n' >"\$root/5/report.next.md"
+if "$CLI" publish 5 completed "\$root/5/report.next.md" 1 >"$TMP/publish-stale.out" 2>"$TMP/publish-stale.err"; then exit 1; fi
+grep -Fq 'stale publication for generation 1; current generation is 2' "$TMP/publish-stale.err"
+[ "\$(state_for 5)" = working ]
+"$CLI" publish 5 blocked "\$root/5/report.next.md" 2 >"$TMP/publish-followup.out" 2>"$TMP/publish-followup.err"
+[ "\$(state_for 5)" = blocked ]
+grep -Fqx 'generation two report' "\$root/5/reports/2.md"
+[ -f "\$pending_before" ]
 
 # Dry-run, off, and notify are non-destructive. Retain their candidates before
 # later on-mode checks so each assertion remains isolated.
@@ -232,6 +242,7 @@ grep -Fq 'unversioned state' "$TMP/status-unversioned.err"
 # stop uses the event lock and preserves blocked delivery state. Purge refuses
 # until acknowledgement, then removes only this terminal worker's state.
 "$CLI" stop 2 >"$TMP/stop-blocked.out" 2>"$TMP/stop-blocked.err"
+grep -Fqx 'stopped subagent #2; reports and delivery state preserved' "$TMP/stop-blocked.out"
 [ -s "\$root/2/result.md" ]
 [ -s "\$root/2/reports/1.md" ]
 if "$CLI" purge 2 >"$TMP/purge-blocked-before.out" 2>"$TMP/purge-blocked-before.err"; then exit 1; fi
@@ -248,6 +259,7 @@ fi
 [ -n "\$(find "\$root/3/unpublished" -type f -name '*.md' -print -quit)" ]
 
 "$CLI" stop --all >"$TMP/stop-all.out" 2>"$TMP/stop-all.err" || true
+if grep -Fq purge "$TMP"/stop*.out; then echo 'stop suggested purge' >&2; exit 1; fi
 echo 0 >"$TMP/lifecycle.rc"
 INNER
 chmod +x "$TMP/lifecycle-inner"

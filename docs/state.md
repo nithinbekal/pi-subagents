@@ -82,9 +82,9 @@ retried: the deterministic event is validated and reused before the lifecycle
 transition. Snapshot names are never overwritten. An orphan snapshot from a
 crash before queue persistence remains visible and blocks purge.
 
-`@@DONE@@` is a behavioral signal for the worker transcript, not a state
-transition. A non-empty `result.md`, non-empty `report.next.md`, quiet pane, or
-stable pane capture cannot create completion state.
+Only successful explicit publication establishes a completed or blocked outcome.
+A final chat reply, non-empty `result.md`, non-empty `report.next.md`, quiet pane,
+or stable pane capture cannot create completion state.
 
 ## Completion event
 

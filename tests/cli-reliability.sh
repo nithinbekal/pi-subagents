@@ -25,7 +25,6 @@ agent_dir=$(dirname "$protocol")
 printf 'durable report for %s\n' "$last" >"$agent_dir/report.next.md"
 publish_cmd=$(grep ' publish [0-9][0-9]* completed ' "$protocol" | head -1)
 sh -c "$publish_cmd" || exit 2
-printf '%s\n' '@@DONE@@'
 sleep 60
 FAKE_PI
 chmod +x "$TMP/bin/fake-pi"

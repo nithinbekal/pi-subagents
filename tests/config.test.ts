@@ -268,6 +268,164 @@ esac
 	}
 });
 
+test("watcher logs automatic cleanup successes without hiding failures or eligibility notices", async (t) => {
+	const success = "subagents cleanup: stopped subagent #7 after completed report and 600s grace; state preserved";
+	const zeroGraceSuccess = "subagents cleanup: stopped subagent #18 after completed report and 0s grace; state preserved";
+	const failedStop = "subagents cleanup: could not stop pane for subagent #8; lifecycle preserved";
+	const failedCommit = "subagents cleanup: pane for subagent #9 stopped but cleanup lifecycle commit failed";
+	const failureDetails = `state helper: cannot rename lifecycle.json: EACCES\n\tpath=/isolated/state/9/lifecycle.json\n\n${failedCommit}\n${failedStop}`;
+	const notice = "subagents cleanup: subagent #7 is eligible for cleanup (notify mode; no pane stopped)";
+	const preview = "subagents cleanup: would stop subagent #7 (completed, grace 600s elapsed)";
+	const nearMatches = [
+		`${success}; cleanup lifecycle commit failed`,
+		`error: ${success}`,
+		success.replace("#7", "#unknown"),
+		success.replace("600s", "-1s"),
+	];
+	const scenarios = [
+		{
+			name: "successful batch", code: 0,
+			batches: [{ stderr: `${success}\n${zeroGraceSuccess}`, entries: 2 }],
+			successes: [success, zeroGraceSuccess], visible: [],
+		},
+		{
+			name: "ordinary warning", code: 0,
+			batches: [{ stderr: "specific CLI warning", entries: 1 }],
+			successes: [], visible: ["specific CLI warning"],
+		},
+		{
+			name: "ordinary error", code: 23,
+			batches: [{ stderr: "specific child failure\n  original detail", entries: 1 }, { stderr: "specific child failure\n  original detail", entries: 1 }],
+			successes: [], visible: ["specific child failure\n  original detail"],
+		},
+		{
+			name: "failed stop", code: 1,
+			batches: [{ stderr: failedStop, entries: 1 }, { stderr: failedStop, entries: 1 }],
+			successes: [], visible: [failedStop],
+		},
+		{
+			name: "stopped pane with failed lifecycle commit", code: 1,
+			batches: [{ stderr: failureDetails, entries: 1 }],
+			successes: [], visible: [failureDetails],
+		},
+		{
+			name: "mixed batches deduplicate failures independently of successes", code: 1,
+			batches: [{ stderr: `${success}\n${failureDetails}\n${zeroGraceSuccess}`, entries: 3 }, { stderr: `${zeroGraceSuccess}\n${failureDetails}`, entries: 2 }],
+			successes: [success, zeroGraceSuccess], visible: [failureDetails],
+		},
+		{
+			name: "unsuccessful exit after only success diagnostics", code: 17,
+			batches: [{ stderr: `\n${success}\n \n`, entries: 2 }],
+			successes: [success], visible: ["CLI command failed"],
+		},
+		{
+			name: "notify-only eligibility", code: 0, mode: "notify",
+			batches: [{ stderr: notice, entries: 1 }],
+			successes: [], visible: [notice],
+		},
+		{
+			name: "dry-run eligibility", code: 0, mode: "dry-run",
+			batches: [{ stderr: preview, entries: 1 }],
+			successes: [], visible: [preview],
+		},
+		{
+			name: "near matches remain visible", code: 0,
+			batches: [{ stderr: nearMatches.join("\n"), entries: nearMatches.length }],
+			successes: [], visible: nearMatches,
+		},
+	];
+	for (const hasUI of [true, false]) {
+		for (const scenario of scenarios) {
+			await t.test(`${hasUI ? "UI" : "headless"}: ${scenario.name}`, async (t) => {
+				const root = await mkdtemp(path.join(tmpdir(), "pi-subagents-cleanup-diagnostic-"));
+				const stateDir = path.join(root, "state");
+				const sessionDir = path.join(stateDir, "$9");
+				const sessionFile = path.join(root, "session.jsonl");
+				const bin = path.join(root, "subagents");
+				const logPath = path.join(stateDir, "watcher.log");
+				await mkdir(path.join(sessionDir, "7"), { recursive: true });
+				await writeFile(path.join(sessionDir, ".schema.json"), JSON.stringify(EXPECTED_PACKAGE_CONTRACT));
+				await writeFile(sessionFile, "");
+				const quote = (text: string): string => `'${text.replaceAll("'", "'\\''")}'`;
+				const first = scenario.batches[0].stderr;
+				const next = scenario.batches[1]?.stderr ?? first;
+				await writeFile(bin, `#!/bin/sh
+case "$1" in
+  protocol) printf '%s\\n' '${JSON.stringify(EXPECTED_PACKAGE_CONTRACT)}' ;;
+  events)
+    [ "$SUBAGENTS_CLEANUP_MODE" = '${scenario.mode ?? "on"}' ] || exit 99
+    if [ -f '${root}/invoked' ]; then
+      printf '%s\\n' ${quote(next)} >&2
+    else
+      : >'${root}/invoked'
+      printf '%s\\n' ${quote(first)} >&2
+    fi
+    exit ${scenario.code}
+    ;;
+  *) exit 98 ;;
+esac
+`, { mode: 0o755 });
+				const previous = saveEnv(["SUBAGENTS_BIN", "SUBAGENTS_STATE_DIR", "SUBAGENTS_WATCH_MS", "SUBAGENTS_CLEANUP_MODE", "TMUX", "TMUX_PANE"]);
+				process.env.SUBAGENTS_BIN = bin;
+				process.env.SUBAGENTS_STATE_DIR = stateDir;
+				process.env.SUBAGENTS_WATCH_MS = "60000";
+				process.env.SUBAGENTS_CLEANUP_MODE = scenario.mode ?? "on";
+				process.env.TMUX = "/tmp/fake-tmux,123,9";
+				delete process.env.TMUX_PANE;
+				const handlers = new Map<string, Function>();
+				const notifications: Array<{ message: string; level: string }> = [];
+				const terminal: string[] = [];
+				t.mock.method(console, "error", (...args: unknown[]) => { terminal.push(args.join(" ")); });
+				let log = "";
+				try {
+					subagentsWatch({
+						on(name: string, handler: Function) { handlers.set(name, handler); },
+						sendMessage() { assert.fail("diagnostics must not inject report messages"); },
+					} as never);
+					handlers.get("session_start")?.({}, {
+						hasUI, sessionManager: { getSessionFile: () => sessionFile },
+						ui: { notify(message: string, level: string) { notifications.push({ message, level }); } },
+					});
+					let expectedEntries = 0;
+					for (const [index, batch] of scenario.batches.entries()) {
+						if (index > 0) handlers.get("message_end")?.({
+							message: { role: "custom", customType: "subagent-report", details: { eventId: "test-wakeup" } },
+						});
+						expectedEntries += batch.entries;
+						for (let i = 0; i < 500; i += 1) {
+							try { log = await readFile(logPath, "utf8"); }
+							catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+							if ((log.match(/^\d{4}-\S+ (?:INFO|WARNING|ERROR) \$9 /gm)?.length ?? 0) >= expectedEntries) break;
+							await new Promise((resolve) => setTimeout(resolve, 10));
+						}
+						assert.equal(log.match(/^\d{4}-\S+ (?:INFO|WARNING|ERROR) \$9 /gm)?.length, expectedEntries, log);
+					}
+				} finally {
+					await handlers.get("session_shutdown")?.();
+					restoreEnv(previous);
+				}
+				const visible = hasUI ? notifications.map(({ message }) => message) : terminal;
+				assert.equal(visible.length, scenario.visible.length);
+				assert.deepEqual(hasUI ? terminal : notifications, []);
+				for (const [index, detail] of scenario.visible.entries()) {
+					assert.ok(visible[index].includes(detail), visible[index]);
+					assert.ok(log.includes(detail), log);
+					if (hasUI) assert.equal(notifications[index].level, scenario.code ? "error" : "warning");
+					if (scenario.code) {
+						assert.match(visible[index], /event detection or cleanup failed/);
+						assert.ok(visible[index].includes(`code=${scenario.code}, signal=null, killed=false`), visible[index]);
+						assert.match(visible[index], /elapsed=\d+ms, budget=10000ms/);
+					}
+				}
+				for (const detail of scenario.successes) {
+					assert.ok(log.includes(` INFO $9 ${detail}\n`), log);
+					assert.ok(visible.every((message) => !message.includes(detail)), visible.join("\n"));
+				}
+			});
+		}
+	}
+});
+
 test("watcher preserves malformed spool records instead of mixing or deleting them", async () => {
 	const root = await mkdtemp(path.join(tmpdir(), "pi-subagents-malformed-event-"));
 	const stateDir = path.join(root, "state");

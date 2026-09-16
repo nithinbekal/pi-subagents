@@ -1,19 +1,19 @@
 # pi-subagents
 
-A public Pi package for running isolated workers in tmux panes. It provides:
+A public Pi package for running isolated workers in tmux panes. The lead supplies
+complete task briefs; workers publish durable reports that the watcher pushes
+back to the lead session.
 
-- `skills/subagents/subagents`: the Bash CLI, report publisher, lifecycle manager,
-  and conservative completed-worker cleanup;
-- `skills/subagents/SKILL.md`: instructions Pi can load on demand;
-- `extensions/subagents-watch.ts`: filesystem-triggered and polling, at-least-once
-  report delivery to the lead Pi session;
-- `protocol.json`: the package, CLI, watcher, event, and state contract.
+- [`skills/subagents/subagents`](skills/subagents/subagents): Bash CLI and lifecycle manager.
+- [`skills/subagents/SKILL.md`](skills/subagents/SKILL.md): on-demand agent instructions.
+- [`extensions/subagents-watch.ts`](extensions/subagents-watch.ts): report delivery and cleanup scheduling.
+- [`protocol.json`](protocol.json): package, CLI, watcher, event, and state contract.
 
 The package contains no task templates, roles, credentials, model defaults, or
-machine-generated state. The spawning agent supplies each complete task brief.
+machine-generated state.
 
 > Pi packages and skills run with your user permissions. Review the extension
-> and executable before installing them.
+> and executable before installing them. Worker isolation is not a security sandbox.
 
 ## Requirements and compatibility
 
@@ -45,280 +45,125 @@ Or install it as a local Pi package:
 pi install /absolute/path/to/pi-subagents
 ```
 
-Pi package discovery loads the extension and skill. Humans may optionally put
-the CLI on `PATH`:
+Pi package discovery loads the extension and skill. Invoke the package-local
+CLI by absolute path. Examples below use `subagents` for readability:
 
 ```bash
-ln -s /absolute/path/to/pi-subagents/skills/subagents/subagents ~/bin/subagents
+/absolute/path/to/pi-subagents/skills/subagents/subagents doctor
 ```
 
-Run `subagents doctor` inside tmux after installation or configuration changes.
+Run `doctor` inside tmux after installation, upgrades, or configuration changes.
+Fix every `FAIL` before launching workers. For optional `PATH` setup and
+configuration, see the [operator guide](docs/operators.md#configuration).
 
-## Configuration
+After changing package files, coordinate a normal Pi `/reload` or restart to
+activate watcher changes. Running watchers use the on-disk CLI immediately, but
+keep their loaded extension code until reload/restart. `doctor` checks the disk
+package and state, not the extension revision loaded in a running Pi process.
 
-All configuration is environment-based. The CLI and watcher must resolve the
-same state directory and package version.
+## Delegate a task
 
-| Variable | Used by | Default | Meaning |
-| --- | --- | --- | --- |
-| `SUBAGENTS_STATE_DIR` | CLI, watcher | `${XDG_STATE_HOME:-$HOME/.local/state}/subagents` | Exact state root. |
-| `XDG_STATE_HOME` | CLI, watcher | `$HOME/.local/state` | Base when `SUBAGENTS_STATE_DIR` is unset. |
-| `XDG_CACHE_HOME` | CLI | `$HOME/.cache` | Base for the 24-hour Pi model catalog cache. |
-| `SUBAGENTS_PI` | CLI | `pi` | Trusted worker launcher command, optionally an authentication wrapper followed by `pi`. |
-| `SUBAGENTS_BIN` | watcher | package-local CLI | Explicit executable used for protocol handshake, events, cleanup, and acknowledgements. |
-| `SUBAGENTS_WINDOW_NAME` | CLI | `subagents` | tmux window name/prefix. |
-| `SUBAGENTS_WAKE` | watcher | `1` | Set to `0` to inject reports without waking an idle lead. |
-| `SUBAGENTS_WATCH_MS` | watcher | `3000` | Poll interval in milliseconds. Invalid or non-positive values use 3000. |
-| `SUBAGENTS_CLEANUP_MODE` | CLI, watcher-launched CLI | `on` | `on`, `off`, `dry-run`, or `notify`. |
-| `SUBAGENTS_CLEANUP_GRACE_SECONDS` | CLI, watcher-launched CLI | `600` | Non-negative grace after a completed worker becomes cleanup-eligible. |
+Write the complete brief to a file using your editor or Pi's write tool. Include
+the objective, repository/worktree and expected branch/HEAD, relevant facts and
+instruction paths, allowed writes, verification, and commit/push permissions.
+Workers do not inherit the lead conversation or discovered context files.
 
-`on` is deliberately useful by default: a durably completed worker that is
-awaiting follow-up becomes eligible after ten minutes. The other modes are:
-
-- `off`: do not evaluate or stop candidates;
-- `dry-run`: report what would stop, without changing lifecycle or panes;
-- `notify`: report each candidate once and keep its pane;
-- `on`: perform a locked two-phase eligibility check, stop the pane, and retain
-  every report, event record, acknowledgement, and lifecycle file.
-
-Use `subagents config` to show resolved values and `subagents protocol` to show
-the exact package contract. Environment used by watcher subprocesses must be
-present in the lead Pi process. tmux servers may outlive the shell that created
-them.
-
-### Trusted launcher wrappers
-
-`SUBAGENTS_PI` supports providers that inject authentication through a wrapper:
+For a long brief, launch from the file:
 
 ```bash
-export SUBAGENTS_PI="$HOME/bin/with-provider-auth pi"
+subagents run --task-file /tmp/parser-brief.md
 ```
 
-It is a trusted shell command and is intentionally word-split. Embedded shell
-quoting is not a portable argument parser, and executable paths with spaces are
-unsupported. Keep wrapper code and credentials outside this repository.
-Task text, generated paths, model ids, and effort values are separately quoted.
+`--task-file PATH` reads literal text from a readable, nonempty UTF-8 file,
+without executing shell expressions or expanding templates. It is mutually exclusive
+with the positional brief; there is no stdin input mode.
+The file must contain the full task brief, not a task name or a role selection.
 
-## Tasks, models, and reasoning inheritance
+For either brief input, if its first character is `@`, the launcher prefixes one
+newline only to the prompt sent to Pi, preventing Pi from treating the brief as
+a file reference. This transport framing does not modify the source task file
+or the saved `task` bytes.
 
-Start a worker with a complete brief:
+Positional briefs remain supported:
 
 ```bash
-subagents run "Inspect the parser, fix the reported bug, run its focused checks, and report changed files and results."
+subagents run "In the current checkout, read README.md and report broken relative Markdown links. Do not edit files, change repository or remote state, or delegate. Include the paths checked and findings in your report."
 ```
 
-Workers start with Pi's built-in coding tools but with discovered extensions,
-skills, prompt templates, context files, and session persistence disabled. The
-brief must contain the objective, relevant paths and context, constraints,
-verification, and shipping requirements.
+Workers start with Pi's built-in coding tools, but discovered extensions, skills,
+prompt templates, context files, and session persistence are disabled. Include
+any instructions they need to read in the brief.
 
-Commands launched by Pi's Bash tool receive the lead's effective
-`PI_PROVIDER`, `PI_MODEL`, and `PI_REASONING_LEVEL`. When `-m` is absent, the CLI
-turns those values into explicit `--model provider/model` and `--thinking`
-arguments and also injects the matching variables into the tmux child command.
-This avoids stale tmux-server defaults. If the lead metadata is unavailable, the
-launcher default is used; a partial or malformed inheritance tuple fails.
+### Models and effort
 
-Explicit selection remains explicit:
+For an explicit selection, use a provider-qualified model and an effort level:
 
 ```bash
-subagents run -m anthropic/claude-sonnet-4-6 "<complete brief>"
-subagents run --model openai/gpt-5.4 --effort high "<complete brief>"
+subagents run -m anthropic/claude-sonnet-4-6 --effort high --task-file /tmp/parser-brief.md
 ```
 
-A model override must be provider-qualified. Before launch, `run` performs a
-lightweight doctor preflight and checks the selected model against Pi's local
-model catalog. It invokes `pi --list-models` directly when `pi` is on `PATH`,
-falling back to the configured launcher only when it is not, and allows up to
-five seconds to rebuild the catalog. Parsed provider/model ids are cached for 24
-hours at `${XDG_CACHE_HOME:-$HOME/.cache}/pi-subagents/models.tsv`; a fresh cache
-is used immediately and refreshed in a detached background process. Explicit
-model ids from `~/.pi/agent/models.json` are merged into the accepted set because
-custom providers are valid worker targets.
+`--model` is an alias for `-m`. Without a model override, commands launched by
+Pi's Bash tool carry the lead's effective `PI_PROVIDER`, `PI_MODEL`, and
+`PI_REASONING_LEVEL` explicitly through tmux. Without lead metadata, the
+launcher default applies. An explicit effort overrides inherited reasoning; an
+explicit model without `--effort` does not inherit the lead model's effort.
+Use explicit flags when your task or local instructions require them.
 
-Use `subagents models` to print the effective catalog or `subagents models
---refresh` to synchronously rebuild the cache. Unknown models fail with fuzzy
-model-id matches across providers. If no catalog is available, an explicit `-m`
-fails before pane creation and points to `models --refresh`; an inherited model
-warns and continues. `--effort` accepts Pi's supported levels. An explicit model
-without `--effort` does not inherit the old model's reasoning level. An explicit
-effort overrides inherited reasoning.
+Discover models with Pi's `/model` picker or `pi --list-models`. Model validity
+and availability are delegated to worker Pi: an invalid selection can fail
+after pane creation. A successful launch is not proof of model acceptance or
+authentication. See [model selection and wrappers](docs/operators.md#models-and-launcher-wrappers).
 
-## CLI workflow
+## Receive and follow up
 
-```bash
-subagents doctor
-subagents models --refresh
-subagents run "Make the requested change, verify it, and report the result"
-subagents status
-subagents retain 1
-subagents release 1
-subagents tell 1 "Use the existing parser rather than adding a dependency"
-subagents peek 1 60
-subagents stop 1
-subagents purge 1       # only after every published report is acknowledged
-```
+1. Launch independent workers, then **end the lead turn**. The watcher pushes
+   reports and wakes an idle lead by default; do not poll for completion.
+2. Read the immutable `reports/<n>.md` path in each pushed report. The message
+   contains a preview, not necessarily the full report. A `completed` worker
+   awaits follow-up; a `blocked` worker needs input and is protected from cleanup.
+3. Before a lengthy review or delayed follow-up, use `subagents retain <id>` to
+   keep the pane. Use `subagents release <id>` only to undo that retention.
+4. Send follow-ups with `subagents tell <id> "<follow-up>"`, then end the turn
+   again. `tell` cancels cleanup and advances the generation before sending.
+   Use it instead of typing directly into a worker pane.
 
-`status` and `ls` report ids, lifecycle state, pane liveness, retention,
-generation, and cleanup timing. They intentionally do not print task text.
-`peek` is the explicit command for inspecting pane content.
+Workers keep working until complete or blocked, write `report.next.md`, and use
+their generated `publish` command for the current generation. Only successful
+explicit publication establishes the outcome. A report file, quiet pane, stable
+output, or final chat reply does not establish completion. After publication,
+the worker waits for follow-up.
 
-### Retain, release, and follow-up
+Use `subagents status` for lifecycle, pane liveness, retention, generation, and
+cleanup timing without task text. Use `subagents peek <id> [lines]` for diagnosis.
+If pane shutdown is requested, `subagents stop <id>` stops that pane and preserves
+state. Do not stop workers just because they reported.
 
-`retain <id>` sets a durable retention flag and cancels any cleanup candidate.
-`release <id>` clears retention; an awaiting-follow-up worker receives a fresh
-cleanup grace period. `tell <id> ...` takes the worker event lock, preserves any unqueued draft under
-`unpublished/`, advances its generation, clears only already-queued mutable
-publication state, rewrites its generation-specific protocol, and marks it
-working before sending the message. A failed send is
-reported as an error and leaves cleanup cancelled rather than claiming success.
+## Reports and automatic cleanup
 
-Use `retain` before a long review or when follow-up may arrive after the normal
-grace. Use `tell` and `retain` rather than typing directly into a worker pane so
-the lifecycle lease remains authoritative.
+Publication saves and fsyncs an immutable report, then fsyncs the queued event,
+then commits lifecycle completion. The watcher delivers **at least once** and
+acknowledges only after the matching custom message appears in the persisted
+lead session. A crash can replay a duplicate; pending reports are not silently
+discarded. Delivery and acknowledgement failures remain visible.
 
-## Atomic completion publication
+Automatic cleanup defaults to `on` with a **600-second grace**. It stops only
+unretained, durably completed workers awaiting follow-up with valid queued or
+acknowledged reports. It rechecks the generation and completion lease under the
+worker lock. Working, starting, blocked, exited, retained, unknown, missing, and
+malformed workers are protected. Successful automatic stops are log-only;
+failures remain visible, and explicit commands still print their results.
 
-Each worker receives a generated protocol containing two explicit publication
-commands for its current generation: `completed` and `blocked`.
+Cleanup stops panes without deleting reports or delivery evidence. `result.md`
+remains a mutable convenience copy: it is empty at launch and reset by `tell`.
+Read the event's immutable report for published work; `report.next.md` is the
+staging file, and a draft there is not proof of publication.
 
-The worker writes a complete report to `report.next.md` and invokes the chosen
-`subagents publish` command. Under the worker's event lock, publication does the
-following in order:
-
-1. validate the lifecycle and exact generation lease;
-2. copy the complete report to a new immutable `reports/<n>.md` snapshot and
-   `fsync` it;
-3. write and `fsync` a deterministic, versioned completion record in
-   `.watcher-pending`, then `fsync` the directory;
-4. atomically commit lifecycle state as `awaiting-follow-up` or `blocked`;
-5. atomically refresh `result.md` for human inspection.
-
-The report snapshot is therefore complete before the durable event exists, and
-the event exists before cleanup eligibility. A crash after spool persistence
-but before lifecycle commit is recovered by replaying the same deterministic
-publication. Existing snapshots are never overwritten.
-
-A report file by itself, `@@DONE@@`, a quiet pane, or stable screen output is not
-a completion signal. Missing, stale, malformed, or unknown lifecycle state is
-treated as working/unknown and protected. `blocked` is explicit and never
-cleanup-eligible. A worker that exits without publication can produce an
-`exited` diagnostic event, but it is not a cleanup candidate.
-
-## Push and pull delivery
-
-### Push mode
-
-With `subagents-watch` loaded, start workers and end the lead turn. The watcher:
-
-1. validates its package and CLI protocol before touching state;
-2. validates the session `.schema.json` before reading its spool;
-3. replays each strict, versioned completion event with `pi.sendMessage`;
-4. waits until the matching Pi 0.84+ `custom_message` entry is observed in the
-   persisted session JSONL;
-5. asks the CLI to acknowledge the event under the worker event lock.
-
-Acknowledgement writes a durable delivery marker and moves the pending event to
-the worker's acknowledgement archive. Malformed or mismatched records are left
-in place and reported; the watcher never quarantines or deletes them as if they
-were delivered.
-
-Delivery is **at least once**. A crash after Pi persists the message but before
-the acknowledgement may replay a duplicate. This is preferred to silent loss.
-The watcher surfaces CLI detection, delivery, and acknowledgement failures.
-
-### Pull mode
-
-Without the watcher, use:
-
-```bash
-subagents wait <id> [seconds]
-subagents reap
-```
-
-Pull commands replay a still-pending durable event, print its immutable report,
-and acknowledge only after printing succeeds. Do not intentionally mix push and
-pull consumers for the same lead session.
-
-## Cleanup safety model
-
-Automatic cleanup considers only a lifecycle that is all of the following:
-
-- explicitly `completed` and `awaiting-follow-up`;
-- not retained and not superseded by `tell`;
-- past the configured grace period;
-- tied to a non-empty immutable report inside that worker's `reports/` folder;
-- backed by a strict completion record that is still queued or durably
-  acknowledged.
-
-Candidate discovery is followed by a second eligibility check while holding the
-same event lock used by publication, `tell`, `retain`, `release`, stop, and
-acknowledgement. The generation and event lease must still match. Cleanup never
-uses pane stability.
-
-Automatic cleanup never stops `starting`, `working`, `blocked`, `exited`,
-retained, unknown, missing, malformed, or merely screen-stable workers. It stops
-only the pane and marks lifecycle `cleaned`; it does not delete worker state,
-spool records, reports, or acknowledgement evidence.
-
-`subagents stop` is an explicit manual pane stop. It uses the event lock and
-preserves state. `subagents purge` is a separate explicit operation and refuses
-to proceed while a pane is alive, an event is pending, a report snapshot lacks
-acknowledgement evidence, or a non-empty current/unpublished report was never
-queued and acknowledged.
-
-## State layout
-
-State is partitioned by tmux's stable session id (`$1`, `$2`, and so on):
-
-```text
-$SUBAGENTS_STATE_DIR/
-├── watcher.log                      # watcher diagnostics, all sessions; rotated to watcher.log.1 at 1 MB
-└── $1/
-    ├── .schema.json                 # exact protocol.json contract
-    ├── .seq                         # monotonic worker id
-    ├── .seq.lock                    # transient hard-link lock
-    ├── .window.lock                 # transient hard-link lock
-    ├── .watcher-pending/            # strict durable completion spool
-    ├── .watcher-delivered/          # durable acknowledgement markers
-    └── 1/
-        ├── .event.lock              # publish/tell/stop/cleanup/ack lock
-        ├── lifecycle.json           # generation, state, retention, candidate lease
-        ├── pane                     # tmux pane id
-        ├── .launch-ready            # parent setup gate released before Pi starts
-        ├── protocol.md              # generated publication instructions
-        ├── task                     # original complete brief; not shown by status
-        ├── report.next.md           # generation report source
-        ├── result.md                # latest published report
-        ├── reports/                 # immutable report snapshots
-        └── events/                  # acknowledged completion records
-```
-
-The watcher never writes to the terminal while Pi has a UI: every diagnostic
-is appended to `watcher.log` (timestamp, level, tmux session, message), and
-the first occurrence of each distinct error is also shown as a Pi
-notification. Repeats and routine lock recoveries land only in the log.
-
-See [`docs/state.md`](docs/state.md) for lifecycle transitions, validation
-invariants, lock behavior, and crash boundaries.
-
-Tasks and reports can contain sensitive project information. Protect the state
-directory accordingly. State for an old tmux session is not automatically
-migrated into a new session.
-
-## Locking and failure behavior
-
-All critical sections use one hard-link lock protocol. Owner metadata is fully
-written before publication. Contenders pin the published inode with a temporary
-hard link before inspection. Every lock read initializes and guards owner
-fields, so a normal owner can unlink between checks without producing an
-unbound-variable failure. A live owner is never evicted by age. Dead-owner
-recovery verifies the same inode through a recovery link before unlinking it.
-
-If a process dies inside takeover, residue fails closed. `doctor` reports the
-path; remove it only after confirming no CLI process is active. Launch and tmux
-send failures are errors, not success messages. Partial launch state is kept
-when it may aid recovery.
+For [pull delivery](docs/operators.md#pull-delivery-without-the-watcher),
+[cleanup modes and explicit state deletion](docs/operators.md#cleanup-and-state-deletion),
+[logs and state paths](docs/operators.md#state-and-diagnosis), or
+[publication details](docs/operators.md#publication-and-delivery-protocol),
+read the operator guide. The [state protocol](docs/state.md) describes lifecycle
+transitions, validation, locks, and crash boundaries.
 
 ## Development checks
 
@@ -334,13 +179,8 @@ bash tests/public-safety.sh
 git diff --check
 ```
 
-The suite covers repeated concurrent launch contention, abandoned locks,
-protocol and state mismatches, model validation and close-match errors,
-effective model/reasoning inheritance, atomic
-publication recovery, at-least-once watcher acknowledgement, lifecycle
-transitions, report preservation, cleanup defaults and grace, dry-run/off/notify,
-retain/release/tell cancellation, and protection for blocked, working, unknown,
-malformed, and unpublished workers.
+`pnpm test` runs the syntax, watcher, CLI, and public-safety checks listed above.
+Behavioral tests exercise isolated temporary state and tmux fixtures.
 
 ## License
 

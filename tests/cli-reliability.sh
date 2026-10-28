@@ -32,6 +32,9 @@ chmod +x "$TMP/bin/fake-pi"
 cat >"$TMP/reliability-inner" <<INNER
 #!/usr/bin/env bash
 set -euo pipefail
+# Record every exit status so the outer poll returns as soon as this script
+# stops, instead of waiting for the fake-pi panes to end.
+trap 'echo \$? >"$TMP/reliability.rc"' EXIT
 export HOME="$TMP/home"
 export SUBAGENTS_STATE_DIR="$TMP/state"
 export SUBAGENTS_PI="$TMP/bin/fake-pi"
@@ -153,7 +156,6 @@ node "$STATE_HELPER" spool "\$session_root/.watcher-pending/\$spool_name.json" "
 
 "$CLI" doctor >"$TMP/doctor-final.out" 2>"$TMP/doctor-final.err"
 grep -Fqx 'doctor: healthy' "$TMP/doctor-final.out"
-echo 0 >"$TMP/reliability.rc"
 INNER
 chmod +x "$TMP/reliability-inner"
 

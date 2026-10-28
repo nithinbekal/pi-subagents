@@ -132,7 +132,7 @@ test("watcher replays a versioned spool and delegates acknowledgement to the CLI
 	await writeFile(bin, `#!/bin/sh
 case "$1" in
   protocol) printf '%s\\n' '${JSON.stringify(EXPECTED_PACKAGE_CONTRACT)}' ;;
-  events) exit 0 ;;
+  events|prune) exit 0 ;;
   ack)
     mkdir -p '${deliveredDir}' '${archiveDir}'
     printf '%s\\n' ack >'${deliveredDir}'/"$3"
@@ -405,6 +405,7 @@ case "$1" in
     fi
     exit ${scenario.code}
     ;;
+  prune) exit 0 ;;
   *) exit 98 ;;
 esac
 `, { mode: 0o755 });
@@ -469,6 +470,68 @@ esac
 	}
 });
 
+test("watcher prunes stale state once per session start, logs the summary, and defers events until it finishes", async () => {
+	const root = await mkdtemp(path.join(tmpdir(), "pi-subagents-prune-"));
+	const stateDir = path.join(root, "state");
+	const sessionDir = path.join(stateDir, "$9");
+	const sessionFile = path.join(root, "session.jsonl");
+	const bin = path.join(root, "subagents");
+	const argvLog = path.join(root, "argv");
+	const logPath = path.join(stateDir, "watcher.log");
+	const summary = "prune: removed 2 worker(s) and 1 session dir(s); skipped 1";
+	await mkdir(path.join(sessionDir, "7"), { recursive: true });
+	await writeFile(path.join(sessionDir, ".schema.json"), JSON.stringify(EXPECTED_PACKAGE_CONTRACT));
+	await writeFile(sessionFile, "");
+	await writeFile(bin, `#!/bin/sh
+printf '%s\\n' "$*" >>'${argvLog}'
+case "$1" in
+  protocol) printf '%s\\n' '${JSON.stringify(EXPECTED_PACKAGE_CONTRACT)}' ;;
+  prune) sleep 0.3; printf '%s\\n' '${summary}'; printf '%s\\n' prune-done >>'${argvLog}' ;;
+  events) exit 0 ;;
+  *) exit 1 ;;
+esac
+`, { mode: 0o755 });
+	const previous = saveEnv(["SUBAGENTS_BIN", "SUBAGENTS_STATE_DIR", "SUBAGENTS_WATCH_MS", "TMUX", "TMUX_PANE"]);
+	process.env.SUBAGENTS_BIN = bin;
+	process.env.SUBAGENTS_STATE_DIR = stateDir;
+	process.env.SUBAGENTS_WATCH_MS = "60000";
+	process.env.TMUX = "/tmp/fake-tmux,123,9";
+	delete process.env.TMUX_PANE;
+	const handlers = new Map<string, Function>();
+	const context = { hasUI: false, sessionManager: { getSessionFile: () => sessionFile }, ui: { notify() {} } };
+	const calls = async (command: string): Promise<number> => (await readFile(argvLog, "utf8")).split("\n").filter((line) => line === command).length;
+	let log = "";
+	try {
+		subagentsWatch({
+			on(name: string, handler: Function) { handlers.set(name, handler); },
+			sendMessage() { assert.fail("prune must not inject messages"); },
+		} as never);
+		for (const starts of [1, 2]) {
+			handlers.get("session_start")?.({}, context);
+			// A repeated session_start while active is ignored and must not prune again.
+			handlers.get("session_start")?.({}, context);
+			for (let i = 0; i < 500; i += 1) {
+				try { log = await readFile(logPath, "utf8"); }
+				catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+				if ((log.match(/ INFO \$9 prune: /g)?.length ?? 0) >= starts) break;
+				await new Promise((resolve) => setTimeout(resolve, 10));
+			}
+			for (let i = 0; i < 500 && (await calls("events")) < starts; i += 1) await new Promise((resolve) => setTimeout(resolve, 10));
+			await handlers.get("session_shutdown")?.();
+			assert.equal(await calls("prune"), starts);
+		}
+		assert.equal(log.match(/^\d{4}-\S+ INFO \$9 prune: removed 2 worker\(s\) and 1 session dir\(s\); skipped 1$/gm)?.length, 2, log);
+		assert.doesNotMatch(log, /ERROR|WARNING/);
+		// The drain scheduled at session start delivers reports immediately but runs
+		// `events` only after prune has released the drain slot.
+		const argv = (await readFile(argvLog, "utf8")).split("\n").filter((line) => line === "prune-done" || line === "events");
+		assert.deepEqual(argv, ["prune-done", "events", "prune-done", "events"], argv.join(","));
+	} finally {
+		await handlers.get("session_shutdown")?.();
+		restoreEnv(previous);
+	}
+});
+
 test("watcher preserves malformed spool records instead of mixing or deleting them", async () => {
 	const root = await mkdtemp(path.join(tmpdir(), "pi-subagents-malformed-event-"));
 	const stateDir = path.join(root, "state");
@@ -482,7 +545,7 @@ test("watcher preserves malformed spool records instead of mixing or deleting th
 	await writeFile(path.join(sessionDir, ".schema.json"), `${JSON.stringify(EXPECTED_PACKAGE_CONTRACT)}\n`);
 	await writeFile(queuedPath, "{not-json\n");
 	await writeFile(sessionFile, "");
-	await writeFile(bin, `#!/bin/sh\ncase "$1" in protocol) printf '%s\\n' '${JSON.stringify(EXPECTED_PACKAGE_CONTRACT)}';; events) exit 0;; *) exit 1;; esac\n`, { mode: 0o755 });
+	await writeFile(bin, `#!/bin/sh\ncase "$1" in protocol) printf '%s\\n' '${JSON.stringify(EXPECTED_PACKAGE_CONTRACT)}';; events|prune) exit 0;; *) exit 1;; esac\n`, { mode: 0o755 });
 	const keys = ["SUBAGENTS_BIN", "SUBAGENTS_STATE_DIR", "SUBAGENTS_WATCH_MS", "TMUX", "TMUX_PANE"] as const;
 	const previous = saveEnv(keys);
 	process.env.SUBAGENTS_BIN = bin;

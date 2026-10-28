@@ -15,6 +15,7 @@
  *
  * Cleanup policy is implemented by `subagents events` in the public package;
  * see SUBAGENTS_CLEANUP_MODE and SUBAGENTS_CLEANUP_GRACE_SECONDS in README.md.
+ * `subagents prune` runs once per session start; SUBAGENTS_PRUNE_DAYS=0 disables it.
  */
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -612,6 +613,20 @@ export default function subagentsWatch(pi: ExtensionAPI) {
 		} catch {
 			/* Polling remains the delivery safety net when filesystem watching is unavailable. */
 		}
+		// Age-based state deletion runs once per Pi session and only removes what
+		// `purge` already accepts. It holds the drain slot while it runs so `events`
+		// never waits on a worker lock whose directory prune is about to delete;
+		// report delivery still happens on every drain, only `events` is deferred.
+		draining = true;
+		const pruneStartedAt = performance.now();
+		execFile(bin, ["prune"], { encoding: "utf8", timeout: COMMAND_TIMEOUT_MS, env: process.env }, (error, stdout, stderr) => {
+			if (error) reportCommandError("prune failed", error, stderr, pruneStartedAt);
+			else for (const line of stdout.split("\n")) if (line.trim()) appendWatcherLog("info", line.trim());
+			const again = pendingDrain;
+			pendingDrain = false;
+			completeDrain();
+			if (again) scheduleDrain(50);
+		});
 		scheduleDrain(0);
 	};
 

@@ -28,9 +28,10 @@ grep -Fqx "state_dir=$TMP/state" <<<"$CONFIG"
 grep -Fqx 'window_name=helpers' <<<"$CONFIG"
 grep -Fqx 'cleanup_mode=on' <<<"$CONFIG"
 grep -Fqx 'cleanup_grace_seconds=600' <<<"$CONFIG"
+grep -Fqx 'prune_days=7' <<<"$CONFIG"
 grep -Fqx 'protocol_id=pi-subagents' <<<"$CONFIG"
 grep -Fqx 'package_version=0.3.2' <<<"$CONFIG"
-[ "$(wc -l <<<"$CONFIG" | tr -d ' ')" = 7 ]
+[ "$(wc -l <<<"$CONFIG" | tr -d ' ')" = 8 ]
 
 PROTOCOL=$(HOME="$TMP/home" "$CLI" protocol)
 node -e 'const p=JSON.parse(process.argv[1]); if(p.protocolId!=="pi-subagents"||p.packageVersion!=="0.3.2"||p.watcherApiVersion!==1)process.exit(1)' "$PROTOCOL"
@@ -39,6 +40,7 @@ grep -Fq 'subagents run [-m MODEL] [--effort LEVEL] <task...>' <<<"$HELP"
 grep -Fq 'subagents run [-m MODEL] [--effort LEVEL] --task-file PATH' <<<"$HELP"
 grep -Fq 'subagents retain <id>' <<<"$HELP"
 grep -Fq 'subagents purge <id|--all>' <<<"$HELP"
+grep -Fq 'subagents prune [--days N] [--dry-run]' <<<"$HELP"
 if grep -Fq 'subagents models' <<<"$HELP"; then exit 1; fi
 for removed_alias in list kill models _refresh-model-cache; do
 	if HOME="$TMP/home" SUBAGENTS_STATE_DIR="$TMP/state" "$CLI" "$removed_alias" >"$TMP/$removed_alias.out" 2>"$TMP/$removed_alias.err"; then

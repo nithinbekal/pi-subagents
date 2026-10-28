@@ -158,6 +158,13 @@ remains a mutable convenience copy: it is empty at launch and reset by `tell`.
 Read the event's immutable report for published work; `report.next.md` is the
 staging file, and a draft there is not proof of publication.
 
+State is deleted only by `subagents purge` or by `subagents prune`, which the
+watcher runs once at every Pi session start. Prune removes terminal workers
+(`cleaned`, `stopped`, `exited`) whose lifecycle is older than
+`SUBAGENTS_PRUNE_DAYS` (default 7; `0` disables), only where `purge` would
+already accept them, then removes emptied directories of tmux sessions that no
+longer exist. `subagents prune --dry-run` previews without deleting.
+
 For [pull delivery](docs/operators.md#pull-delivery-without-the-watcher),
 [cleanup modes and explicit state deletion](docs/operators.md#cleanup-and-state-deletion),
 [logs and state paths](docs/operators.md#state-and-diagnosis), or

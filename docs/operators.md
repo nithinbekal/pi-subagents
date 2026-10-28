@@ -30,6 +30,7 @@ in the skill.
 | `SUBAGENTS_WATCH_MS` | watcher | `3000` | Poll interval in milliseconds. Invalid or non-positive values use 3000. |
 | `SUBAGENTS_CLEANUP_MODE` | CLI, watcher-launched CLI | `on` | `on`, `off`, `dry-run`, or `notify`. |
 | `SUBAGENTS_CLEANUP_GRACE_SECONDS` | CLI, watcher-launched CLI | `600` | Non-negative grace after a completed worker becomes cleanup-eligible. |
+| `SUBAGENTS_PRUNE_DAYS` | CLI, watcher-launched CLI | `7` | Age in days after which terminal worker state is pruned at Pi session start; `0` disables. |
 
 ```bash
 subagents config
@@ -203,6 +204,30 @@ and refuses deletion if any of these remain:
 Do not bypass a refusal by deleting reports, drafts, or delivery evidence.
 Acknowledgement proves delivery, not that the history is no longer needed.
 Choose deletion only when it is intended. Cleanup and stop never require purge.
+
+#### Age-based pruning
+
+`subagents prune [--days N] [--dry-run]` applies purge automatically by age.
+The watcher runs it once per Pi session start; the summary line goes to
+`watcher.log` and a failure is reported like any other CLI error. A worker in
+any session directory qualifies when its lifecycle is terminal (`cleaned`,
+`stopped`, or `exited`) and was last updated more than `N` days ago. `N`
+defaults to `SUBAGENTS_PRUNE_DAYS`, then to 7; `0` disables pruning. Every
+candidate goes through the same lock and checks as `purge`, so prune never
+deletes anything that `purge` would refuse: a refused candidate is counted as
+skipped and stays. After the workers, a session directory is removed only when
+its tmux session id is not running and nothing remains in it but bookkeeping
+(schema marker, id counter, lock residue, delivery markers, and a spool without
+queued events); the current session's directory is never removed. tmux reuses
+session ids after a server restart, so a live id does not protect old workers
+inside it. Preview with:
+
+```bash
+subagents prune --dry-run
+```
+
+It prints `prune: removed R worker(s) and S session dir(s); skipped K` (or
+`prune (dry run): would remove …` with the paths involved).
 
 ## State and diagnosis
 

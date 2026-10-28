@@ -462,6 +462,13 @@ function acknowledge(sessionRoot, id, eventId, pendingPath, now) {
 	}
 }
 
+function workerIds(sessionRoot) {
+	return fs.readdirSync(sessionRoot, { withFileTypes: true })
+		.filter((entry) => entry.isDirectory() && /^\d+$/.test(entry.name))
+		.map((entry) => entry.name)
+		.sort((a, b) => Number(a) - Number(b));
+}
+
 function purgeCheck(agentDir, sessionRoot) {
 	const id = path.basename(agentDir);
 	const lifecycle = readLifecycle(path.join(agentDir, "lifecycle.json"));
@@ -617,11 +624,7 @@ try {
 			const now = Number(rawNow);
 			const grace = Number(rawGrace);
 			if (!nonNegativeInteger(now) || !nonNegativeInteger(grace)) throw new Error("invalid scan time");
-			const ids = fs.readdirSync(sessionRoot, { withFileTypes: true })
-				.filter((entry) => entry.isDirectory() && /^\d+$/.test(entry.name))
-				.map((entry) => entry.name)
-				.sort((a, b) => Number(a) - Number(b));
-			for (const id of ids) {
+			for (const id of workerIds(sessionRoot)) {
 				let detect = 1;
 				let cleanup = 1;
 				try {
@@ -662,6 +665,22 @@ try {
 		case "purge-check": {
 			const eventIds = purgeCheck(args[0], args[1]);
 			if (eventIds.length > 0) process.stdout.write(`${eventIds.join("\n")}\n`);
+			break;
+		}
+		// Lock-free prescreen for `prune`: terminal workers whose lifecycle last
+		// changed before CUTOFF. purge_one repeats every safety check under the lock.
+		case "prune-scan": {
+			const [sessionRoot, rawCutoff] = args;
+			const cutoff = Number(rawCutoff);
+			if (!nonNegativeInteger(cutoff)) throw new Error("invalid prune cutoff");
+			for (const id of workerIds(sessionRoot)) {
+				try {
+					const lifecycle = readLifecycle(path.join(sessionRoot, id, "lifecycle.json"));
+					if (["cleaned", "stopped", "exited"].includes(lifecycle.state) && lifecycle.updatedAt < cutoff) process.stdout.write(`${id}\n`);
+				} catch {
+					// Missing or malformed lifecycle: never a prune candidate.
+				}
+			}
 			break;
 		}
 		default:

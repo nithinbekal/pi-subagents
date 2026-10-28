@@ -54,6 +54,16 @@ ack_worker() {
 	read -r event spool <<<"\$(node -e 'const x=JSON.parse(require("fs").readFileSync(process.argv[1])); console.log(x.eventId, x.spoolName)' "\$root/\$id/lifecycle.json")"
 	"$CLI" ack "\$id" "\$event" "\$spool.json"
 }
+age_lifecycle() {
+	local file="\$1" field="\$2" seconds="\$3"
+	node - "\$file" "\$field" "\$seconds" <<'NODE'
+const fs = require("fs");
+const [file, field, seconds] = process.argv.slice(2);
+const value = JSON.parse(fs.readFileSync(file, "utf8"));
+value[field] -= Number(seconds);
+fs.writeFileSync(file, JSON.stringify(value) + "\\n");
+NODE
+}
 
 root=""
 launch 1
@@ -260,6 +270,70 @@ fi
 
 "$CLI" stop --all >"$TMP/stop-all.out" 2>"$TMP/stop-all.err" || true
 if grep -Fq purge "$TMP"/stop*.out; then echo 'stop suggested purge' >&2; exit 1; fi
+
+# prune deletes only terminal workers whose lifecycle is older than the age
+# limit and that purge already accepts. #13 (old, cleaned, acknowledged) goes;
+# #14 (recent) and #15 (old but awaiting follow-up) stay; #11 (old, stopped,
+# but with an unacknowledged snapshot) is skipped. The orphan session dir \$99
+# holds one old terminal worker plus bookkeeping and is removed entirely.
+launch 13
+publish 13 completed
+ack_worker 13
+launch 14
+publish 14 completed
+ack_worker 14
+age_lifecycle "\$root/13/lifecycle.json" candidateSince 601
+age_lifecycle "\$root/14/lifecycle.json" candidateSince 601
+"$CLI" cleanup >"$TMP/cleanup-prune.out" 2>"$TMP/cleanup-prune.err"
+[ "\$(state_for 13)" = cleaned ]
+[ "\$(state_for 14)" = cleaned ]
+launch 15
+"$CLI" retain 15 >/dev/null
+publish 15 completed
+ack_worker 15
+[ "\$(state_for 11)" = stopped ]
+for id in 11 13 15; do age_lifecycle "\$root/\$id/lifecycle.json" updatedAt \$((10 * 86400)); done
+orphan="$TMP/state/\\\$99"
+mkdir -p "\$orphan/.watcher-pending" "\$orphan/.watcher-delivered"
+cp "\$root/.schema.json" "\$root/.seq" "\$orphan/"
+cp -R "\$root/13" "\$orphan/13"
+cp "\$root/.watcher-delivered/\$(node -e 'console.log(JSON.parse(require("fs").readFileSync(process.argv[1])).eventId)' "\$root/13/lifecycle.json")" "\$orphan/.watcher-delivered/"
+printf '{malformed\n' >"\$orphan/.watcher-pending/stale.json.corrupt"
+: >"\$orphan/.schema.lock.candidate.1.1.1"
+node - "\$root" "\$orphan" <<'NODE'
+const fs = require("fs");
+const path = require("path");
+const [from, to] = process.argv.slice(2);
+const files = ["lifecycle.json", ...fs.readdirSync(path.join(to, "13", "events")).map((name) => path.join("events", name))];
+for (const file of files) {
+	const target = path.join(to, "13", file);
+	fs.writeFileSync(target, fs.readFileSync(target, "utf8").split(from).join(to));
+}
+NODE
+"$CLI" prune --dry-run >"$TMP/prune-dry.out" 2>"$TMP/prune-dry.err"
+grep -Fqx "would remove \$root/13" "$TMP/prune-dry.out"
+grep -Fqx "would remove \$orphan/13" "$TMP/prune-dry.out"
+grep -Fqx "would remove \$orphan" "$TMP/prune-dry.out"
+grep -Fqx 'prune (dry run): would remove 2 worker(s) and 1 session dir(s); skipped 1' "$TMP/prune-dry.out"
+[ "\$(wc -l <"$TMP/prune-dry.out" | tr -d ' ')" = 4 ]
+[ -d "\$root/13" ]
+[ -d "\$orphan/13" ]
+SUBAGENTS_PRUNE_DAYS=0 "$CLI" prune >"$TMP/prune-disabled.out" 2>"$TMP/prune-disabled.err"
+grep -Fqx 'prune: disabled' "$TMP/prune-disabled.out"
+[ -d "\$root/13" ]
+"$CLI" prune >"$TMP/prune.out" 2>"$TMP/prune.err"
+grep -Fqx 'prune: removed 2 worker(s) and 1 session dir(s); skipped 1' "$TMP/prune.out"
+[ ! -s "$TMP/prune.err" ]
+[ ! -e "\$root/13" ]
+[ ! -e "\$orphan" ]
+[ -d "\$root/11" ]
+[ -d "\$root/14" ]
+[ -d "\$root/15" ]
+[ -f "\$root/.schema.json" ]
+[ "\$(state_for 14)" = cleaned ]
+[ "\$(state_for 15)" = awaiting-follow-up ]
+"$CLI" prune >"$TMP/prune-again.out" 2>"$TMP/prune-again.err"
+grep -Fqx 'prune: removed 0 worker(s) and 0 session dir(s); skipped 1' "$TMP/prune-again.out"
 echo 0 >"$TMP/lifecycle.rc"
 INNER
 chmod +x "$TMP/lifecycle-inner"
@@ -271,7 +345,7 @@ for _ in {1..900}; do
 	sleep 0.1
 done
 if [ "$(cat "$TMP/lifecycle.rc" 2>/dev/null || true)" != 0 ]; then
-	for output in "$TMP"/*.err "$TMP"/cleanup-*.out; do [ -s "$output" ] && { echo "=== $output ===" >&2; tail -120 "$output" >&2; }; done
+	for output in "$TMP"/*.err "$TMP"/cleanup-*.out "$TMP"/prune*.out; do [ -s "$output" ] && { echo "=== $output ===" >&2; tail -120 "$output" >&2; }; done
 	exit 1
 fi
 

@@ -26,6 +26,9 @@
 #   subagents cleanup                   Apply the configured completed-worker cleanup policy now.
 #   subagents stop <id|--all>           Stop panes while preserving reports and delivery state.
 #   subagents purge <id|--all>          Delete stopped state only after every report is acknowledged.
+#   subagents prune [--days N] [--dry-run]
+#                                       Purge terminal workers older than N days (default 7) in every
+#                                       session dir, then remove emptied dirs of dead tmux sessions.
 
 set -uo pipefail
 # The watcher destroys our stdout/stderr before it signals a timeout. A default
@@ -45,8 +48,10 @@ STATE_SCHEMA_VERSION=1
 EVENT_SCHEMA_VERSION=1
 LIFECYCLE_SCHEMA_VERSION=1
 DEFAULT_CLEANUP_GRACE_SECONDS=600
+DEFAULT_PRUNE_DAYS=7
 CLEANUP_MODE="${SUBAGENTS_CLEANUP_MODE:-on}"
 CLEANUP_GRACE_SECONDS="${SUBAGENTS_CLEANUP_GRACE_SECONDS:-$DEFAULT_CLEANUP_GRACE_SECONDS}"
+PRUNE_DAYS="${SUBAGENTS_PRUNE_DAYS:-$DEFAULT_PRUNE_DAYS}"
 SCRIPT_DIR=$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 PACKAGE_ROOT=$(cd "$SCRIPT_DIR/../.." && pwd)
 PACKAGE_JSON="$PACKAGE_ROOT/package.json"
@@ -116,6 +121,7 @@ NODE
 validate_cleanup_config() {
 	case "$CLEANUP_MODE" in on|off|dry-run|notify) ;; *) die "invalid SUBAGENTS_CLEANUP_MODE '$CLEANUP_MODE' (expected on, off, dry-run, or notify)" ;; esac
 	case "$CLEANUP_GRACE_SECONDS" in ''|*[!0-9]*) die "invalid SUBAGENTS_CLEANUP_GRACE_SECONDS '$CLEANUP_GRACE_SECONDS'" ;; esac
+	case "$PRUNE_DAYS" in ''|*[!0-9]*) die "invalid SUBAGENTS_PRUNE_DAYS '$PRUNE_DAYS'" ;; esac
 }
 
 validate_package_contract
@@ -793,6 +799,7 @@ cmd_config() {
 	printf 'window_name=%s\n' "$WIN_PREFIX"
 	printf 'cleanup_mode=%s\n' "$CLEANUP_MODE"
 	printf 'cleanup_grace_seconds=%s\n' "$CLEANUP_GRACE_SECONDS"
+	printf 'prune_days=%s\n' "$PRUNE_DAYS"
 	printf 'protocol_id=%s\n' "$PROTOCOL_ID"
 	printf 'package_version=%s\n' "$PACKAGE_VERSION"
 }
@@ -1221,12 +1228,13 @@ ack_cli() {
 }
 
 purge_one() {
-	local id="$1" dir pane event_ids event_id
+	local id="$1" mode="${2:-}" dir pane event_ids event_id
 	dir=$(sadir "$id"); [ -d "$dir" ] || { warn "subagents: no subagent #$id"; return 1; }
 	lock_acquire "$dir/.event.lock" "event consumer for subagent #$id"
 	pane=$(cat "$dir/pane" 2>/dev/null || true)
 	if [ -n "$pane" ] && pane_alive "$pane"; then lock_release; warn "subagents: subagent #$id is still running; stop it before purge"; return 1; fi
 	if ! event_ids=$(node "$STATE_HELPER" purge-check "$dir" "$(sr)"); then lock_release; return 1; fi
+	if [ "$mode" = dry-run ]; then lock_release; return 0; fi
 	# The lifecycle is terminal and no pending event exists. Remove the directory
 	# while still owning its event lock so no stop/tell/ack operation can interleave.
 	if ! rm -rf "$dir"; then lock_release; warn "subagents: failed to purge state for subagent #$id"; return 1; fi
@@ -1250,6 +1258,70 @@ cmd_purge() {
 	fi
 }
 
+# Entries of a session dir that are more than lock or delivery bookkeeping.
+# Worker ids listed in $2 are ignored (dry-run candidates that would be gone).
+session_residue() {
+	local dir="$1" ignore=" ${2:-} " entry name
+	for entry in "$dir"/* "$dir"/.*; do
+		name=$(basename "$entry")
+		case "$name" in .|..) continue ;; esac
+		[ -e "$entry" ] || continue
+		case "$name" in
+			.schema.json|.seq*|.*.lock.candidate.*|.watcher-delivered) continue ;;
+			.watcher-pending) compgen -G "$entry/*.json" >/dev/null || continue ;;
+			*[!0-9]*) ;;
+			*) case "$ignore" in *" $name "*) continue ;; esac ;;
+		esac
+		printf '%s\n' "$name"
+	done
+}
+
+# Age-based purge across every session dir. Each candidate still goes through
+# purge_one, in a subshell so one refusal (lock contention, unacknowledged
+# report, dir already pruned by another Pi process) is a skip, not an abort.
+cmd_prune() {
+	local days="$PRUNE_DAYS" dry_run=0 mode="" label=prune verb=removed cutoff current_session session_dir name
+	local candidates id pruned live removed=0 sessions_removed=0 skipped=0
+	while [ $# -gt 0 ]; do
+		case "$1" in
+			--days) [ $# -ge 2 ] || die "--days needs a value"; days="$2"; shift 2 ;;
+			--dry-run) dry_run=1; mode=dry-run; label="prune (dry run)"; verb="would remove"; shift ;;
+			*) die "usage: subagents prune [--days N] [--dry-run]" ;;
+		esac
+	done
+	case "$days" in ''|*[!0-9]*) die "invalid prune days '$days'" ;; esac
+	if [ "$days" = 0 ]; then echo "prune: disabled"; return 0; fi
+	[ -r "$STATE_DIR" ] && [ -x "$STATE_DIR" ] || die "cannot read state directory $STATE_DIR"
+	cutoff=$(( $(date +%s) - days * 86400 ))
+	[ "$cutoff" -gt 0 ] || cutoff=0
+	current_session=$(current_session_id)
+	for session_dir in "$STATE_DIR"/*/; do
+		session_dir=${session_dir%/}
+		name=$(basename "$session_dir")
+		[ -d "$session_dir" ] && valid_session_id "$name" || continue
+		candidates=$(node "$STATE_HELPER" prune-scan "$session_dir" "$cutoff" 2>/dev/null) || continue
+		pruned=""
+		for id in $candidates; do
+			if (_SR="$session_dir"; purge_one "$id" "$mode") >/dev/null 2>&1; then
+				removed=$((removed + 1)); pruned="$pruned $id"
+				[ "$dry_run" = 0 ] || echo "$verb $session_dir/$id"
+			else
+				skipped=$((skipped + 1))
+			fi
+		done
+		# tmux reuses session ids after a server restart, so a live id says nothing
+		# about worker age; a dir goes only when its session is gone and nothing
+		# but bookkeeping remains. The current session dir is never removed.
+		[ "$name" != "$current_session" ] || continue
+		live=$(tmux list-sessions -F '#{session_id}' 2>/dev/null) || continue
+		if printf '%s\n' "$live" | grep -Fqx "$name"; then continue; fi
+		[ -z "$(session_residue "$session_dir" "$pruned")" ] || continue
+		if [ "$dry_run" = 1 ]; then echo "$verb $session_dir"; sessions_removed=$((sessions_removed + 1))
+		elif rm -rf "$session_dir" 2>/dev/null; then sessions_removed=$((sessions_removed + 1)); fi
+	done
+	echo "$label: $verb $removed worker(s) and $sessions_removed session dir(s); skipped $skipped"
+}
+
 usage() { awk 'NR>1 && /^#/{sub(/^# ?/,""); print; next} NR>1 && !/^#/{exit}' "$0"; }
 
 cmd="${1:-}"; shift || true
@@ -1258,7 +1330,7 @@ case "$cmd" in
 	config) cmd_config "$@" ;;
 	run) cmd_run "$@" ;;
 	""|-h|--help|help) usage ;;
-	doctor|publish|tell|retain|release|wait|events|reap|status|peek|ls|cleanup|stop|purge|ack)
+	doctor|publish|tell|retain|release|wait|events|reap|status|peek|ls|cleanup|stop|purge|prune|ack)
 		prepare_session_state
 		case "$cmd" in
 			doctor) cmd_doctor "$@" ;;
@@ -1275,6 +1347,7 @@ case "$cmd" in
 			cleanup) cmd_cleanup "$@" ;;
 			stop) cmd_stop "$@" ;;
 			purge) cmd_purge "$@" ;;
+			prune) cmd_prune "$@" ;;
 			ack) ack_cli "$@" ;;
 		esac
 		;;

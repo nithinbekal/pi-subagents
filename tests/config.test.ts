@@ -17,7 +17,7 @@ import {
 	subagentsBinCandidates,
 	validatePackageContract,
 } from "../extensions/config.ts";
-import subagentsWatch, { resolveWatchInterval } from "../extensions/subagents-watch.ts";
+import subagentsWatch, { resolveWatchInterval, runCli } from "../extensions/subagents-watch.ts";
 
 function eventId(id: string, generation: number, status: string, completionKey: string): string {
 	return createHash("sha256")
@@ -266,6 +266,49 @@ esac
 			});
 		}
 	}
+});
+
+test("CLI watchdog grants a fresh budget after a late fire instead of killing the child", async () => {
+	const root = await mkdtemp(path.join(tmpdir(), "pi-subagents-late-watchdog-"));
+	const bin = path.join(root, "subagents");
+	const release = path.join(root, "release");
+	// The child outlives the first budget by construction: it exits only once
+	// the late fire has been observed, then well inside the fresh budget.
+	await writeFile(bin, `#!/bin/sh\nwhile [ ! -e '${release}' ]; do sleep 0.02; done\nexit 0\n`, { mode: 0o755 });
+	// The clock jumps 60 s between arming and the first check, as after sleep/wake.
+	const budgetMs = 500;
+	const armedAt = 1_000;
+	const reads = [armedAt, armedAt + 60_000];
+	const now = (): number => reads.shift() ?? armedAt + 60_000;
+	const late: number[] = [];
+	const onLate = (lateMs: number): void => {
+		late.push(lateMs);
+		writeFile(release, "").catch(() => {});
+	};
+	const error = await new Promise<{ killed?: unknown } | null>((resolve) => {
+		runCli(bin, ["events"], { budgetMs, now, onLate }, (failure) => resolve(failure));
+	});
+	assert.notEqual(error?.killed, true);
+	assert.equal(error, null);
+	assert.equal(late.length, 1);
+	assert.ok(late[0] > budgetMs, String(late[0]));
+});
+
+test("CLI watchdog kills a child that outlives an on-time budget and reports the kill", async () => {
+	const root = await mkdtemp(path.join(tmpdir(), "pi-subagents-ontime-watchdog-"));
+	const bin = path.join(root, "subagents");
+	await writeFile(bin, "#!/bin/sh\ntrap 'exit 19' TERM; while :; do sleep 0.05; done\n", { mode: 0o755 });
+	const late: number[] = [];
+	const startedAt = performance.now();
+	const error = await new Promise<{ code?: unknown; signal?: unknown; killed?: unknown } | null>((resolve) => {
+		runCli(bin, ["events"], { budgetMs: 1000, onLate: (lateMs) => late.push(lateMs) }, (failure) => resolve(failure));
+	});
+	assert.ok(error, "expected the killed child to fail");
+	assert.equal(error.killed, true);
+	assert.equal(error.code, 19);
+	assert.equal(error.signal, null);
+	assert.deepEqual(late, []);
+	assert.ok(performance.now() - startedAt >= 1000);
 });
 
 test("watcher logs automatic cleanup successes without hiding failures or eligibility notices", async (t) => {

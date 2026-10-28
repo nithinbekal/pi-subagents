@@ -172,6 +172,50 @@ function readCliContract(bin: string): PackageContract {
 	return value as PackageContract;
 }
 
+// execFile's `timeout` runs on libuv's clock, which keeps counting through
+// system sleep: on wake the deadline fires at once and kills a child that had
+// almost no real runtime, mid-critical-section, leaving an abandoned lock. A
+// watchdog that fires more than a whole budget late means the event loop did
+// not run on time (suspension or a blocked loop), so the child is granted a
+// fresh budget instead. Only an on-time fire kills the child.
+export function runCli(
+	bin: string,
+	args: readonly string[],
+	options: { budgetMs?: number; now?: () => number; onLate?: (lateMs: number) => void },
+	callback: (error: ExecFileException | null, stdout: string, stderr: string) => void,
+): void {
+	const budgetMs = options.budgetMs ?? COMMAND_TIMEOUT_MS;
+	const now = options.now ?? (() => performance.now());
+	let watchdog: ReturnType<typeof setTimeout> | null = null;
+	let killed = false;
+	const child = execFile(bin, [...args], { encoding: "utf8", env: process.env }, (error, stdout, stderr) => {
+		if (watchdog) clearTimeout(watchdog);
+		watchdog = null;
+		// Report our kill in `killed` exactly as Node reports its own timeout.
+		if (error && killed) error.killed = true;
+		callback(error, stdout, stderr);
+	});
+	const arm = (): void => {
+		const armedAt = now();
+		watchdog = setTimeout(() => {
+			const late = now() - armedAt - budgetMs;
+			if (late > budgetMs) {
+				options.onLate?.(late);
+				arm();
+				return;
+			}
+			watchdog = null;
+			killed = true;
+			// Like Node's timeout: stop waiting on pipes a grandchild may hold open.
+			child.stdout?.destroy();
+			child.stderr?.destroy();
+			child.kill("SIGTERM");
+		}, budgetMs);
+		if (typeof watchdog.unref === "function") watchdog.unref();
+	};
+	arm();
+}
+
 export default function subagentsWatch(pi: ExtensionAPI) {
 	validatePackageContract();
 	const bin = findSubagentsBin();
@@ -266,6 +310,10 @@ export default function subagentsWatch(pi: ExtensionAPI) {
 		}
 	};
 
+	const logLateWatchdog = (command: string) => (lateMs: number): void => {
+		appendWatcherLog("info", `cli ${command} watchdog fired ${Math.round(lateMs)}ms late; assuming suspension, granted a fresh ${COMMAND_TIMEOUT_MS}ms budget`);
+	};
+
 	const reportCommandError = (operation: string, error: ExecFileException, stderr: string, startedAt: number): void => {
 		const message = stderr.trim() || error.message.trimEnd();
 		const facts = `code=${String(error.code)}, signal=${String(error.signal)}, killed=${String(error.killed)}`;
@@ -358,10 +406,10 @@ export default function subagentsWatch(pi: ExtensionAPI) {
 		if (ackPromises.has(event.eventId)) return;
 		const promise = new Promise<void>((resolve) => {
 			const startedAt = performance.now();
-			execFile(
+			runCli(
 				bin,
 				["ack", event.id, event.eventId, path.basename(queuedPath)],
-				{ encoding: "utf8", timeout: COMMAND_TIMEOUT_MS, env: process.env },
+				{ onLate: logLateWatchdog("ack") },
 				(error, _stdout, stderr) => {
 					if (error) reportCommandError(`acknowledgement failed for event ${event.eventId}`, error, stderr, startedAt);
 					else {
@@ -510,7 +558,7 @@ export default function subagentsWatch(pi: ExtensionAPI) {
 		drainPromise = new Promise<void>((resolve) => { finishDrain = resolve; });
 		try {
 			const startedAt = performance.now();
-			execFile(bin, ["events"], { encoding: "utf8", timeout: COMMAND_TIMEOUT_MS, env: process.env }, (error, _stdout, stderr) => {
+			runCli(bin, ["events"], { onLate: logLateWatchdog("events") }, (error, _stdout, stderr) => {
 				try {
 					const diagnostics = logCleanupSuccesses(stderr.trim() ? stderr : error?.message ?? "");
 					if (error) reportCommandError("event detection or cleanup failed", error, diagnostics.trim() || "CLI command failed", startedAt);

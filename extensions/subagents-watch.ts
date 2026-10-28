@@ -39,6 +39,8 @@ const WATCHER_LOG_NAME = "watcher.log";
 const WATCHER_LOG_MAX_BYTES = 1_000_000;
 const DEFAULT_WATCH_MS = 3000;
 const COMMAND_TIMEOUT_MS = 10_000;
+// A first prune over a large backlog runs purge-check per worker (about 0.1 s each).
+const PRUNE_TIMEOUT_MS = 120_000;
 const DELIVERY_RETRY_MS = 30 * 60_000;
 
 const EVENT_KEYS = [
@@ -311,17 +313,17 @@ export default function subagentsWatch(pi: ExtensionAPI) {
 		}
 	};
 
-	const logLateWatchdog = (command: string) => (lateMs: number): void => {
-		appendWatcherLog("info", `cli ${command} watchdog fired ${Math.round(lateMs)}ms late; assuming suspension, granted a fresh ${COMMAND_TIMEOUT_MS}ms budget`);
+	const logLateWatchdog = (command: string, budgetMs = COMMAND_TIMEOUT_MS) => (lateMs: number): void => {
+		appendWatcherLog("info", `cli ${command} watchdog fired ${Math.round(lateMs)}ms late; assuming suspension, granted a fresh ${budgetMs}ms budget`);
 	};
 
-	const reportCommandError = (operation: string, error: ExecFileException, stderr: string, startedAt: number): void => {
+	const reportCommandError = (operation: string, error: ExecFileException, stderr: string, startedAt: number, budgetMs = COMMAND_TIMEOUT_MS): void => {
 		const message = stderr.trim() || error.message.trimEnd();
 		const facts = `code=${String(error.code)}, signal=${String(error.signal)}, killed=${String(error.killed)}`;
 		// Elapsed time is diagnostic only, not part of the recurring-error key.
 		// A killed child alone does not prove that its timeout fired.
 		reportError(operation, `${message} (${facts})`,
-			`elapsed=${Math.round(performance.now() - startedAt)}ms, budget=${COMMAND_TIMEOUT_MS}ms`);
+			`elapsed=${Math.round(performance.now() - startedAt)}ms, budget=${budgetMs}ms`);
 	};
 
 	const hasSubagents = (): boolean => {
@@ -619,8 +621,8 @@ export default function subagentsWatch(pi: ExtensionAPI) {
 		// report delivery still happens on every drain, only `events` is deferred.
 		draining = true;
 		const pruneStartedAt = performance.now();
-		execFile(bin, ["prune"], { encoding: "utf8", timeout: COMMAND_TIMEOUT_MS, env: process.env }, (error, stdout, stderr) => {
-			if (error) reportCommandError("prune failed", error, stderr, pruneStartedAt);
+		runCli(bin, ["prune"], { budgetMs: PRUNE_TIMEOUT_MS, onLate: logLateWatchdog("prune", PRUNE_TIMEOUT_MS) }, (error, stdout, stderr) => {
+			if (error) reportCommandError("prune failed", error, stderr, pruneStartedAt, PRUNE_TIMEOUT_MS);
 			else for (const line of stdout.split("\n")) if (line.trim()) appendWatcherLog("info", line.trim());
 			const again = pendingDrain;
 			pendingDrain = false;

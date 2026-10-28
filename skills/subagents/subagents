@@ -66,8 +66,14 @@ _SR=""
 CLEANUP_ACTIONS=0
 CLEANUP_FAILURES=0
 
+# bash 3.2 keeps the bytes of a failed builtin write in its stdout buffer and
+# flushes them into the next command substitution. Once a stream is gone,
+# point it at /dev/null and drain the stale bytes there.
+warn() { printf '%s\n' "$*" >&2 || { exec 2>/dev/null; printf '%s' '' >&2; }; }
+emit() { printf "$@" || { exec >/dev/null; printf '%s' ''; }; }
+
 # Print an error and let the EXIT trap release any lock held by this process.
-die() { echo "subagents: $*" >&2; exit 1; }
+die() { warn "subagents: $*"; exit 1; }
 in_tmux() { [ -n "${TMUX:-}" ]; }
 
 validate_package_contract() {
@@ -205,7 +211,7 @@ process_identity() {
 
 lock_record_valid() {
 	local owner_pid="" owner_identity="" owner_token="" owner_time="" extra=""
-	read -r owner_pid owner_identity owner_token owner_time extra <"$1" 2>/dev/null || return 1
+	read -r owner_pid owner_identity owner_token owner_time extra 2>/dev/null <"$1" || return 1
 	case "$owner_pid" in ''|*[!0-9]*) return 1 ;; esac
 	case "$owner_time" in ''|*[!0-9]*) return 1 ;; esac
 	[ -n "$owner_identity" ] && [ -n "$owner_token" ] && [ -z "$extra" ]
@@ -230,7 +236,7 @@ lock_snapshot_remove() {
 # malformed record and never an excuse to evaluate an unset owner_pid.
 lock_owner_abandoned() {
 	local lock="$1" owner_pid="" owner_identity="" owner_token="" owner_time="" extra="" current_identity
-	read -r owner_pid owner_identity owner_token owner_time extra <"$lock" 2>/dev/null || return 1
+	read -r owner_pid owner_identity owner_token owner_time extra 2>/dev/null <"$lock" || return 1
 	case "$owner_pid" in ''|*[!0-9]*) return 1 ;; esac
 	case "$owner_time" in ''|*[!0-9]*) return 1 ;; esac
 	[ -n "$owner_identity" ] && [ -n "$owner_token" ] && [ -z "$extra" ] || return 1
@@ -244,7 +250,7 @@ lock_owner_abandoned() {
 
 lock_owner_description() {
 	local owner_pid="" owner_identity="" owner_token="" owner_time=""
-	if ! read -r owner_pid owner_identity owner_token owner_time <"$1" 2>/dev/null; then
+	if ! read -r owner_pid owner_identity owner_token owner_time 2>/dev/null <"$1"; then
 		printf '%s' "unreadable owner"
 		return
 	fi
@@ -264,7 +270,7 @@ recover_abandoned_lock() {
 	owner=$(lock_owner_description "$recovery")
 	rm -f "$lock" || { rm -f "$recovery" 2>/dev/null || true; return 1; }
 	rm -f "$recovery" 2>/dev/null || true
-	echo "subagents: recovered abandoned $label lock ($owner)" >&2
+	warn "subagents: recovered abandoned $label lock ($owner)"
 	return 0
 }
 
@@ -553,7 +559,7 @@ publish_report_locked() {
 		report_arg=""
 	else
 		if ! snapshot "$id" "$source"; then
-			echo "subagents: could not snapshot completion for subagent #$id" >&2
+			warn "subagents: could not snapshot completion for subagent #$id"
 			return 2
 		fi
 		report_arg="$SNAPSHOT_PATH"
@@ -561,16 +567,16 @@ publish_report_locked() {
 	now=$(date +%s)
 	if ! report_path=$(node "$STATE_HELPER" spool "$target" "$(sr)" "$id" "$generation" "$status" "$outcome" \
 		"$completion_key" "$event_id" "$report_arg" "$now"); then
-		echo "subagents: could not durably queue completion for subagent #$id" >&2
+		warn "subagents: could not durably queue completion for subagent #$id"
 		return 2
 	fi
 	if ! node "$STATE_HELPER" finish-publish "$dir/lifecycle.json" "$outcome" "$now" "$generation" \
 		"$completion_key" "$spool_name" "$event_id" "$report_path"; then
-		echo "subagents: could not commit lifecycle completion for subagent #$id" >&2
+		warn "subagents: could not commit lifecycle completion for subagent #$id"
 		return 2
 	fi
 	if ! node "$STATE_HELPER" replace-snapshot "$report_path" "$dir/result.md"; then
-		echo "subagents: completion is durable, but could not update current report for subagent #$id" >&2
+		warn "subagents: completion is durable, but could not update current report for subagent #$id"
 		return 2
 	fi
 	if [ "$existed" = 1 ]; then
@@ -578,7 +584,7 @@ publish_report_locked() {
 		return 3
 	fi
 	commit_snapshot_sequence "$dir" || return 2
-	printf '%s\t%s\t%s\n' "$id" "$status" "$report_path"
+	emit '%s\t%s\t%s\n' "$id" "$status" "$report_path"
 	return 0
 }
 
@@ -611,14 +617,14 @@ publish_exit_locked() {
 		"$spool_name" "$event_id" "$report_path" || return 2
 	if [ "$existed" = 1 ]; then sync_snapshot_sequence "$dir"; return 3; fi
 	commit_snapshot_sequence "$dir" || return 2
-	printf '%s\t%s\t%s\n' "$id" "$status" "$report_path"
+	emit '%s\t%s\t%s\n' "$id" "$status" "$report_path"
 }
 
 _emit_for_locked() {
 	local id="$1" durable="${2:-1}" dir lease state generation outcome pending pane
 	dir=$(sadir "$id")
 	if ! lease=$(node "$STATE_HELPER" lease "$dir/lifecycle.json"); then
-		echo "subagents: lifecycle for subagent #$id is missing or malformed; treating it as unknown/working" >&2
+		warn "subagents: lifecycle for subagent #$id is missing or malformed; treating it as unknown/working"
 		return 2
 	fi
 	IFS=$'\t' read -r state generation <<<"$lease"
@@ -627,17 +633,17 @@ _emit_for_locked() {
 			if [ "$durable" = 0 ] && pending=$(node "$STATE_HELPER" pending "$dir/lifecycle.json" "$(sr)" 2>/dev/null); then
 				local pstatus preport pevent ppath
 				IFS=$'\t' read -r pstatus preport pevent ppath <<<"$pending"
-				printf '%s\t%s\t%s\n' "$id" "$pstatus" "$preport"
+				emit '%s\t%s\t%s\n' "$id" "$pstatus" "$preport"
 				return 0
 			fi
 			return 1
 			;;
 		cleaned|stopped|exited) return 1 ;;
 		starting|working) ;;
-		*) echo "subagents: unknown lifecycle state for subagent #$id" >&2; return 2 ;;
+		*) warn "subagents: unknown lifecycle state for subagent #$id"; return 2 ;;
 	esac
 	if [ ! -s "$dir/pane" ]; then
-		echo "subagents: subagent #$id has no pane identity; treating it as unknown/working" >&2
+		warn "subagents: subagent #$id has no pane identity; treating it as unknown/working"
 		return 2
 	fi
 	pane=$(cat "$dir/pane")
@@ -683,7 +689,7 @@ pull_ack() {
 
 cleanup_log() {
 	local context="$1"; shift
-	if [ "$context" = events ]; then echo "subagents cleanup: $*" >&2; else echo "cleanup: $*"; fi
+	if [ "$context" = events ]; then warn "subagents cleanup: $*"; else echo "cleanup: $*"; fi
 }
 
 cleanup_one() {
@@ -1162,18 +1168,18 @@ cmd_ls() { cmd_status; }
 
 stop_one() {
 	local id="$1" dir pane rc=0 emit_rc
-	dir=$(sadir "$id"); [ -d "$dir" ] || { echo "subagents: no subagent #$id" >&2; return 1; }
+	dir=$(sadir "$id"); [ -d "$dir" ] || { warn "subagents: no subagent #$id"; return 1; }
 	lock_acquire "$dir/.event.lock" "event consumer for subagent #$id"
 	_emit_for_locked "$id" 1 >/dev/null; emit_rc=$?
-	[ "$emit_rc" = 2 ] && echo "subagents: warning: could not publish current state for subagent #$id; report files are preserved" >&2
+	[ "$emit_rc" = 2 ] && warn "subagents: warning: could not publish current state for subagent #$id; report files are preserved"
 	pane=$(cat "$dir/pane" 2>/dev/null || true)
 	if [ -n "$pane" ] && pane_alive "$pane"; then
-		if ! tmux kill-pane -t "$pane" 2>/dev/null; then echo "subagents: failed to stop pane for subagent #$id" >&2; rc=1; fi
+		if ! tmux kill-pane -t "$pane" 2>/dev/null; then warn "subagents: failed to stop pane for subagent #$id"; rc=1; fi
 	fi
 	if node "$STATE_HELPER" validate "$dir/lifecycle.json" 2>/dev/null; then
-		lifecycle_transition "$id" stopped >/dev/null || { echo "subagents: failed to persist stopped lifecycle for subagent #$id" >&2; rc=1; }
+		lifecycle_transition "$id" stopped >/dev/null || { warn "subagents: failed to persist stopped lifecycle for subagent #$id"; rc=1; }
 	else
-		echo "subagents: lifecycle for subagent #$id is malformed; pane was manually stopped and all state was preserved" >&2
+		warn "subagents: lifecycle for subagent #$id is malformed; pane was manually stopped and all state was preserved"
 		rc=1
 	fi
 	lock_release
@@ -1216,14 +1222,14 @@ ack_cli() {
 
 purge_one() {
 	local id="$1" dir pane event_ids event_id
-	dir=$(sadir "$id"); [ -d "$dir" ] || { echo "subagents: no subagent #$id" >&2; return 1; }
+	dir=$(sadir "$id"); [ -d "$dir" ] || { warn "subagents: no subagent #$id"; return 1; }
 	lock_acquire "$dir/.event.lock" "event consumer for subagent #$id"
 	pane=$(cat "$dir/pane" 2>/dev/null || true)
-	if [ -n "$pane" ] && pane_alive "$pane"; then lock_release; echo "subagents: subagent #$id is still running; stop it before purge" >&2; return 1; fi
+	if [ -n "$pane" ] && pane_alive "$pane"; then lock_release; warn "subagents: subagent #$id is still running; stop it before purge"; return 1; fi
 	if ! event_ids=$(node "$STATE_HELPER" purge-check "$dir" "$(sr)"); then lock_release; return 1; fi
 	# The lifecycle is terminal and no pending event exists. Remove the directory
 	# while still owning its event lock so no stop/tell/ack operation can interleave.
-	if ! rm -rf "$dir"; then lock_release; echo "subagents: failed to purge state for subagent #$id" >&2; return 1; fi
+	if ! rm -rf "$dir"; then lock_release; warn "subagents: failed to purge state for subagent #$id"; return 1; fi
 	LOCK_PATH=""; LOCK_TOKEN=""; LOCK_CANDIDATE=""; LOCK_SNAPSHOT=""
 	for event_id in $event_ids; do rm -f "$(sr)/.watcher-delivered/$event_id" 2>/dev/null || true; done
 	echo "purged subagent #$id after report acknowledgement"

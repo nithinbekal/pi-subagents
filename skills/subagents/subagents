@@ -806,7 +806,7 @@ cmd_config() {
 
 cmd_doctor() {
 	local failures=0 warnings=0 orphan_sessions=0 root count dir name pane pane_session launcher_bin session_id
-	local lock_path lock_label event_file
+	local lock_path lock_label event_file lease state
 	session_id=$(current_session_id)
 	root=$(sr)
 	launcher_bin=$(launcher_binary)
@@ -840,7 +840,10 @@ cmd_doctor() {
 		if [ ! -s "$dir/pane" ] || [ ! -s "$dir/protocol.md" ] || [ ! -s "$dir/task" ] || [ ! -f "$dir/result.md" ]; then
 			echo "FAIL state: incomplete agent dir $dir"; failures=$((failures + 1)); continue
 		fi
-		if ! node "$STATE_HELPER" validate "$dir/lifecycle.json" 2>/dev/null; then echo "FAIL state: invalid lifecycle for agent #$name"; failures=$((failures + 1)); fi
+		state=""
+		if lease=$(node "$STATE_HELPER" lease "$dir/lifecycle.json" 2>/dev/null); then IFS=$'\t' read -r state _ <<<"$lease"; else
+			echo "FAIL state: invalid lifecycle for agent #$name"; failures=$((failures + 1))
+		fi
 		lock_path="$dir/.event.lock"
 		if [ -e "$lock_path" ]; then
 			if lock_owner_abandoned "$lock_path"; then echo "WARN state: abandoned event lock for agent #$name ($(lock_owner_description "$lock_path"))"; warnings=$((warnings + 1));
@@ -849,7 +852,9 @@ cmd_doctor() {
 		[ ! -e "$lock_path.recover" ] || { echo "WARN state: incomplete event lock recovery for agent #$name"; warnings=$((warnings + 1)); }
 		pane=$(cat "$dir/pane")
 		pane_session=$(tmux display-message -pt "$pane" '#{session_id}' 2>/dev/null || true)
-		if [ -z "$pane_session" ]; then echo "WARN state: agent #$name pane $pane is gone"; warnings=$((warnings + 1));
+		# A terminal worker's pane is expected to be gone; only a live lifecycle warns.
+		if [ -z "$pane_session" ]; then
+			case "$state" in cleaned|stopped|exited) ;; *) echo "WARN state: agent #$name pane $pane is gone"; warnings=$((warnings + 1)) ;; esac
 		elif [ "$pane_session" != "$session_id" ]; then echo "FAIL state: agent #$name pane belongs to $pane_session, not $session_id"; failures=$((failures + 1)); fi
 	done
 	for event_file in "$root"/.watcher-pending/*.json; do

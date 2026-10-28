@@ -334,6 +334,13 @@ grep -Fqx 'prune: removed 2 worker(s) and 1 session dir(s); skipped 1' "$TMP/pru
 [ "\$(state_for 15)" = awaiting-follow-up ]
 "$CLI" prune >"$TMP/prune-again.out" 2>"$TMP/prune-again.err"
 grep -Fqx 'prune: removed 0 worker(s) and 0 session dir(s); skipped 1' "$TMP/prune-again.out"
+
+# doctor warns about a missing pane only while the lifecycle is still live.
+launch 16
+tmux kill-pane -t "\$(cat "\$root/16/pane")"
+"$CLI" doctor >"$TMP/doctor-prune.out" 2>"$TMP/doctor-prune.err"
+grep -Fq "WARN state: agent #16 pane" "$TMP/doctor-prune.out"
+[ "\$(grep -c ' is gone' "$TMP/doctor-prune.out")" = 1 ]
 echo 0 >"$TMP/lifecycle.rc"
 INNER
 chmod +x "$TMP/lifecycle-inner"
@@ -345,7 +352,7 @@ for _ in {1..900}; do
 	sleep 0.1
 done
 if [ "$(cat "$TMP/lifecycle.rc" 2>/dev/null || true)" != 0 ]; then
-	for output in "$TMP"/*.err "$TMP"/cleanup-*.out "$TMP"/prune*.out; do [ -s "$output" ] && { echo "=== $output ===" >&2; tail -120 "$output" >&2; }; done
+	for output in "$TMP"/*.err "$TMP"/cleanup-*.out "$TMP"/prune*.out "$TMP"/doctor-*.out; do [ -s "$output" ] && { echo "=== $output ===" >&2; tail -120 "$output" >&2; }; done
 	exit 1
 fi
 

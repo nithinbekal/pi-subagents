@@ -210,6 +210,21 @@ function readEvent(file, expected = {}) {
 	return validateEvent(readJson(file, `completion event ${file}`), expected);
 }
 
+function sameCompletionPayload(left, right) {
+	return [
+		"protocolId",
+		"packageVersion",
+		"schemaVersion",
+		"id",
+		"generation",
+		"status",
+		"outcome",
+		"completionKey",
+		"eventId",
+		"reportBody",
+	].every((key) => left[key] === right[key]);
+}
+
 function initialRecord(id, now) {
 	return {
 		protocolId: PROTOCOL.protocolId,
@@ -399,11 +414,29 @@ function completionRecord(sessionRoot, lifecycle) {
 	return null;
 }
 
+function readArchivedEvent(sessionRoot, expected) {
+	const { archiveDir } = agentDirectories(sessionRoot, expected.id);
+	const archivePath = path.join(archiveDir, `${expected.eventId}.json`);
+	if (!fs.existsSync(archivePath)) return null;
+	const event = readEvent(archivePath, expected);
+	validateEventReport(event, sessionRoot);
+	return event;
+}
+
 function ensureSpool(target, expected, reportPath, createdAt, sessionRoot) {
-	if (fs.existsSync(target)) {
-		const event = readEvent(target, expected);
-		validateEventReport(event, sessionRoot);
-		return event;
+	const pendingEvent = fs.existsSync(target) ? readEvent(target, expected) : null;
+	if (pendingEvent) validateEventReport(pendingEvent, sessionRoot);
+	const archivedEvent = readArchivedEvent(sessionRoot, expected);
+	if (pendingEvent && archivedEvent) {
+		if (!sameCompletionPayload(pendingEvent, archivedEvent)) throw new Error("archived event conflicts with pending event");
+		return archivedEvent;
+	}
+	if (pendingEvent) return pendingEvent;
+	if (archivedEvent) {
+		if (reportPath && fs.readFileSync(reportPath, "utf8") !== archivedEvent.reportBody) {
+			throw new Error("archived completion does not match the publication source");
+		}
+		return archivedEvent;
 	}
 	if (!reportPath) throw new Error("durable completion record is missing after an interrupted publication");
 	const reportBody = fs.readFileSync(reportPath, "utf8");
@@ -431,35 +464,30 @@ function acknowledge(sessionRoot, id, eventId, pendingPath, now) {
 	if (!inside(pendingPath, dirs.pendingDir)) throw new Error("pending path is outside the completion spool");
 	const pendingName = path.basename(pendingPath);
 	ensureSafeLeaf(pendingName, "pending filename");
-	const archivePath = path.join(dirs.archiveDir, `${eventId}.json`);
-	let event;
-	if (fs.existsSync(pendingPath)) {
-		event = readEvent(pendingPath, { id, eventId });
-		validateEventReport(event, sessionRoot);
-	} else if (fs.existsSync(archivePath)) {
-		event = readEvent(archivePath, { id, eventId });
-		validateEventReport(event, sessionRoot);
-	} else {
-		throw new Error("completion is neither pending nor archived");
+	const pendingEvent = fs.existsSync(pendingPath) ? readEvent(pendingPath, { id, eventId }) : null;
+	if (pendingEvent) validateEventReport(pendingEvent, sessionRoot);
+	const archivedEvent = readArchivedEvent(sessionRoot, { id, eventId });
+	if (!pendingEvent && !archivedEvent) throw new Error("completion is neither pending nor archived");
+	if (pendingEvent && archivedEvent && !sameCompletionPayload(pendingEvent, archivedEvent)) {
+		throw new Error("archived event conflicts with pending event");
 	}
 
 	fs.mkdirSync(dirs.deliveredDir, { recursive: true });
 	const marker = path.join(dirs.deliveredDir, eventId);
 	if (!fs.existsSync(marker)) atomicWrite(marker, `${now}\n`);
 
-	fs.mkdirSync(dirs.archiveDir, { recursive: true });
-	if (fs.existsSync(archivePath)) {
-		const archived = readEvent(archivePath, { id, eventId });
-		if (JSON.stringify(archived) !== JSON.stringify(event)) throw new Error("archived event conflicts with pending event");
-		if (fs.existsSync(pendingPath)) {
+	if (archivedEvent) {
+		if (pendingEvent) {
 			fs.unlinkSync(pendingPath);
 			fsyncDirectory(dirs.pendingDir);
 		}
-	} else {
-		fs.renameSync(pendingPath, archivePath);
-		fsyncDirectory(dirs.pendingDir);
-		fsyncDirectory(dirs.archiveDir);
+		return;
 	}
+
+	fs.mkdirSync(dirs.archiveDir, { recursive: true });
+	fs.renameSync(pendingPath, path.join(dirs.archiveDir, `${eventId}.json`));
+	fsyncDirectory(dirs.pendingDir);
+	fsyncDirectory(dirs.archiveDir);
 }
 
 function workerIds(sessionRoot) {

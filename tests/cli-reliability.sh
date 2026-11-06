@@ -154,6 +154,55 @@ node "$STATE_HELPER" spool "\$session_root/.watcher-pending/\$spool_name.json" "
 [ "\$(find "\$session_root/.watcher-pending" -type f -name '*.json' | wc -l | tr -d ' ')" = 32 ]
 [ "\$(node -e 'console.log(JSON.parse(require("fs").readFileSync(process.argv[1])).state)' "\$session_root/32/lifecycle.json")" = awaiting-follow-up ]
 
+# Reconcile a duplicate pending snapshot against its already-archived completion.
+"$CLI" run "manual-publish archived retry" >"$TMP/run.33.out" 2>"$TMP/run.33.err"
+printf 'archived retry report\n' >"\$session_root/33/report.next.md"
+"$CLI" publish 33 completed "\$session_root/33/report.next.md" 1 >"$TMP/publish-33.out" 2>"$TMP/publish-33.err"
+read -r event_id spool_name <<<"\$(node -e 'const x=JSON.parse(require("fs").readFileSync(process.argv[1])); console.log(x.eventId, x.spoolName)' "\$session_root/33/lifecycle.json")"
+archive="\$session_root/33/events/\$event_id.json"
+pending="\$session_root/.watcher-pending/\$spool_name.json"
+"$CLI" ack 33 "\$event_id" "\$spool_name.json" >"$TMP/ack-33.out" 2>"$TMP/ack-33.err"
+cp "\$archive" "$TMP/archive-33.saved"
+rm "\$session_root/.watcher-delivered/\$event_id"
+printf 'conflicting report body\n' >"\$session_root/33/reports/3.md"
+node - "\$archive" "\$pending" "\$session_root/33/reports/3.md" <<'NODE'
+const fs = require("fs");
+const [archivePath, pendingPath, reportPath] = process.argv.slice(2);
+const event = JSON.parse(fs.readFileSync(archivePath, "utf8"));
+event.reportPath = reportPath;
+event.reportBody = fs.readFileSync(reportPath, "utf8");
+event.createdAt += 9;
+fs.writeFileSync(pendingPath, JSON.stringify(event) + "\n");
+NODE
+if "$CLI" ack 33 "\$event_id" "\$spool_name.json" >"$TMP/ack-33-conflict.out" 2>"$TMP/ack-33-conflict.err"; then
+	echo 'acknowledgement discarded a conflicting duplicate event' >&2
+	exit 1
+fi
+grep -Fq 'archived event conflicts with pending event' "$TMP/ack-33-conflict.err"
+[ -f "\$pending" ]
+[ ! -e "\$session_root/.watcher-delivered/\$event_id" ]
+cmp "$TMP/archive-33.saved" "\$archive"
+cp "\$archive" "$TMP/event-33-original.json"
+node - "$TMP/event-33-original.json" "\$pending" "\$session_root/33/reports/2.md" <<'NODE'
+const fs = require("fs");
+const [archivePath, pendingPath, reportPath] = process.argv.slice(2);
+const event = JSON.parse(fs.readFileSync(archivePath, "utf8"));
+fs.copyFileSync(event.reportPath, reportPath);
+event.reportPath = reportPath;
+event.createdAt += 9;
+fs.writeFileSync(pendingPath, JSON.stringify(event) + "\n");
+NODE
+rm "\$session_root/33/reports/3.md"
+"$CLI" ack 33 "\$event_id" "\$spool_name.json" >"$TMP/ack-33-duplicate.out" 2>"$TMP/ack-33-duplicate.err"
+[ ! -e "\$pending" ]
+[ -f "\$session_root/.watcher-delivered/\$event_id" ]
+cmp "$TMP/archive-33.saved" "\$archive"
+cmp "\$session_root/33/reports/1.md" "\$session_root/33/reports/2.md"
+"$CLI" publish 33 completed "\$session_root/33/report.next.md" 1 >"$TMP/publish-33-retry.out" 2>"$TMP/publish-33-retry.err"
+[ "\$(find "\$session_root/33/reports" -type f -name '*.md' | wc -l | tr -d ' ')" = 2 ]
+[ ! -e "\$session_root/.watcher-pending/\$spool_name.json" ]
+cmp "$TMP/archive-33.saved" "\$archive"
+
 "$CLI" doctor >"$TMP/doctor-final.out" 2>"$TMP/doctor-final.err"
 grep -Fqx 'doctor: healthy' "$TMP/doctor-final.out"
 INNER

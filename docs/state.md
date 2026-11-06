@@ -79,8 +79,10 @@ fixed report source path. It then:
 The complete report therefore precedes the durable completion record, and the
 record precedes lifecycle cleanup eligibility. A crash after step 3 can be
 retried: the deterministic event is validated and reused before the lifecycle
-transition. Snapshot names are never overwritten. An orphan snapshot from a
-crash before queue persistence remains visible and blocks purge.
+transition. A replay after acknowledgement reuses the archived report snapshot
+when its body matches the publication source; it does not create another
+snapshot. Snapshot names are never overwritten. An orphan snapshot from a crash
+before queue persistence remains visible and blocks purge.
 
 Only successful explicit publication establishes a completed or blocked outcome.
 A final chat reply, non-empty `result.md`, non-empty `report.next.md`, quiet pane,
@@ -114,12 +116,15 @@ acknowledge on `sendMessage` return. It scans the Pi 0.84+ session JSONL until i
 observes a top-level `custom_message` with custom type `subagent-report` and the
 matching event id.
 
-The watcher then invokes the CLI `ack` operation. Under `.event.lock`, the CLI:
-
-1. revalidates the pending event and immutable report;
-2. durably writes `.watcher-delivered/<eventId>`;
-3. moves the pending event into `<worker>/events/<eventId>.json`;
-4. fsyncs the pending and archive directories.
+The watcher then invokes the CLI `ack` operation. Under `.event.lock`, the CLI
+revalidates the pending event and immutable report, durably writes
+`.watcher-delivered/<eventId>`, moves the pending event into
+`<worker>/events/<eventId>.json`, and fsyncs the pending and archive directories.
+If an archive already exists, a pending duplicate is removed only when both
+records have the same protocol, package/schema, worker/generation, status,
+outcome, completion key, event id, and report body, and each record's snapshot
+matches that body. Their `reportPath` and `createdAt` may differ. A conflicting
+record remains in place and acknowledgement fails.
 
 The archive is acknowledgement evidence and remains until explicit purge. There
 is no time-based acknowledgement pruning. If a crash occurs after Pi persistence

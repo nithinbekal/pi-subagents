@@ -284,7 +284,7 @@ lock_release() {
 	local owner_pid="" owner_identity="" owner_token="" owner_time=""
 	[ -n "$LOCK_PATH" ] || return 0
 	if lock_snapshot "$LOCK_PATH"; then
-		if read -r owner_pid owner_identity owner_token owner_time <"$LOCK_SNAPSHOT" 2>/dev/null \
+		if read -r owner_pid owner_identity owner_token owner_time 2>/dev/null <"$LOCK_SNAPSHOT" \
 			&& [ "$owner_token" = "$LOCK_TOKEN" ] \
 			&& [ -f "$LOCK_PATH" ] && [ "$LOCK_PATH" -ef "$LOCK_SNAPSHOT" ]; then
 			rm -f "$LOCK_PATH" 2>/dev/null || true
@@ -550,7 +550,7 @@ sync_snapshot_sequence() {
 }
 
 publish_report_locked() {
-	local id="$1" generation="$2" outcome="$3" source="$4" dir checksum bytes status completion_key event_id spool_name pending target report_arg report_path now existed=0
+	local id="$1" generation="$2" outcome="$3" source="$4" dir checksum bytes status completion_key event_id spool_name pending target archive report_arg report_path now existed=0
 	dir=$(sadir "$id")
 	read -r checksum bytes <<<"$(cksum <"$source")"
 	case "$outcome" in completed) status="done" ;; blocked) status="blocked" ;; *) return 2 ;; esac
@@ -559,10 +559,14 @@ publish_report_locked() {
 	spool_name="$id-$generation-$event_id"
 	pending="$(sr)/.watcher-pending"
 	target="$pending/$spool_name.json"
+	archive="$dir/events/$event_id.json"
 	mkdir -p "$pending" || return 2
 	if [ -f "$target" ]; then
 		existed=1
 		report_arg=""
+	elif [ -f "$archive" ]; then
+		existed=1
+		report_arg="$source"
 	else
 		if ! snapshot "$id" "$source"; then
 			warn "subagents: could not snapshot completion for subagent #$id"
